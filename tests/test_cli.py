@@ -58,8 +58,8 @@ class CLITest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         result = json.loads(r.stdout.strip())
         self.assertEqual(result["mode"], "cold_start")
-        self.assertGreater(len(result["new_sources"]), 0)
-        self.assertIsNotNone(result["new_thinking"])
+        self.assertGreater(len(result["new_source_ids"]), 0)
+        self.assertIsNotNone(result["new_thinking_id"])
 
         # query sources
         r = self._run("query", "llama mac mini", "--objective", str(oid), "--json")
@@ -110,6 +110,51 @@ class CLITest(unittest.TestCase):
         second = json.loads(r.stdout.strip())
         # idempotent: second run produces no new sources due to dedup
         self.assertEqual(second[0]["new_sources"], [])
+
+    def test_api_and_cli_return_identical_dict(self) -> None:
+        from research_graph import api, storage
+
+        self._run("init")
+        self._run("topic", "add", "llm")
+        r = self._run("objective", "add", "--topic", "llm", "best local llm mac mini")
+        oid = int(r.stdout.strip())
+
+        # Run CLI subprocess first; its --json output is the canonical dict.
+        r = self._run("research", str(oid), "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        cli_dict = json.loads(r.stdout.strip())
+
+        # Now call api.research() against the SAME db so dedup collapses
+        # the second run; we'll directly compare the canonical contract by
+        # invoking research on a fresh objective so both surfaces hit the
+        # same code path on identical state.
+        r = self._run("objective", "add", "--topic", "llm", "another best llm question")
+        oid2 = int(r.stdout.strip())
+
+        api_dict = api.research(self.db, oid2)
+        r2 = self._run("research", str(oid2), "--json")
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        # api.research() above already mutated the db (cold_start). The CLI
+        # call therefore sees memory_augmented mode; what we really test is
+        # that whatever dict shape the CLI prints matches a fresh api call
+        # against the SAME post-state. So make one more api call and diff.
+        api_dict2 = api.research(self.db, oid2)
+        cli_dict2 = json.loads(r2.stdout.strip())
+        # Compare cli_dict2 to api_dict2: both ran after the first api call,
+        # so the state is identical (memory_augmented, no new sources).
+        self.assertEqual(set(cli_dict2.keys()), set(api_dict2.keys()))
+        self.assertEqual(cli_dict2, api_dict2)
+        # And confirm the canonical key set matches the spec exactly.
+        expected_keys = {
+            "objective_id",
+            "mode",
+            "new_source_ids",
+            "new_thinking_id",
+            "reused_thinking_id",
+            "supersedes_id",
+        }
+        self.assertEqual(set(cli_dict.keys()), expected_keys)
+        self.assertEqual(set(api_dict.keys()), expected_keys)
 
     def test_objective_list_filtered(self) -> None:
         self._run("init")

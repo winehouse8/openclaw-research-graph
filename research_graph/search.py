@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import importlib
 import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 
 @dataclass
@@ -43,11 +42,20 @@ class OfflineFixtureSearch:
         return [SearchHit(url=h["url"], title=h["title"], content=h["content"]) for h in hits]
 
 
+_BUILTIN_BACKENDS: dict[str, Callable[[], ExternalSearch]] = {
+    "offline": OfflineFixtureSearch,
+}
+
+
+def register_backend(name: str, factory: Callable[[], ExternalSearch]) -> None:
+    """Explicit extension point for trusted callers to register a backend."""
+    _BUILTIN_BACKENDS[name] = factory
+
+
 def get_default_search() -> ExternalSearch:
-    dotted = os.environ.get("OPENCLAW_RESEARCH_SEARCH")
-    if dotted:
-        mod_name, _, attr = dotted.rpartition(".")
-        mod = importlib.import_module(mod_name)
-        factory = getattr(mod, attr)
-        return factory()
-    return OfflineFixtureSearch()
+    name = os.environ.get("OPENCLAW_RESEARCH_SEARCH", "offline").strip() or "offline"
+    if name not in _BUILTIN_BACKENDS:
+        raise ValueError(
+            f"unknown search backend {name!r}; allowed: {sorted(_BUILTIN_BACKENDS)}"
+        )
+    return _BUILTIN_BACKENDS[name]()

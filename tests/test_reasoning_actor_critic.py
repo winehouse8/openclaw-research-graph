@@ -48,6 +48,40 @@ class ReasoningTest(unittest.TestCase):
         verdict = reasoning.critic_verify(self.conn, big_quote, [self.sid1])
         self.assertFalse(verdict.accepted)
 
+    def test_critic_rejects_offset_misaligned_quote(self) -> None:
+        # Build a long source whose verbatim slice starting at offset 13 (NOT 0)
+        # exceeds the 200-char quote budget.
+        long_body = (
+            "PREFIXPREFIX_" +  # 13 chars of unrelated prefix at offset 0
+            "Llama 3 reaches eighteen tokens per second on a 16GB Mac mini using metal "
+            "acceleration; Mistral 7B reaches twenty-two tokens per second on the same "
+            "hardware according to recent benchmarking notes from independent reviewers "
+            "all over the internet today."
+        )
+        sid, _ = dedup.upsert_source(self.conn, self.oid, None, None, long_body)
+        slice_start = 13
+        slice_len = 210
+        verbatim = long_body[slice_start : slice_start + slice_len]
+        self.assertEqual(len(verbatim), slice_len)
+        thinking = "Some preamble. " + verbatim + " Some trailing analysis."
+        verdict = reasoning.critic_verify(self.conn, thinking, [sid])
+        self.assertFalse(verdict.accepted)
+        self.assertTrue(
+            any("quoted verbatim" in r for r in verdict.reasons),
+            verdict.reasons,
+        )
+
+    def test_critic_accepts_short_offset_quote(self) -> None:
+        # A 38-char verbatim run at source offset 7 must NOT trip the quote rule
+        # (under MIN_VERBATIM_RUN=40 threshold).
+        body = "ABCDEFG_short verbatim run here that is fine_TRAILING JUNK CONTENT"
+        sid, _ = dedup.upsert_source(self.conn, self.oid, None, None, body)
+        verbatim = body[7 : 7 + 38]
+        self.assertEqual(len(verbatim), 38)
+        thinking = f"- source {sid} keywords: alpha, beta\n{verbatim}"
+        verdict = reasoning.critic_verify(self.conn, thinking, [sid])
+        self.assertTrue(verdict.accepted, verdict.reasons)
+
     def test_rejected_thinking_not_persisted(self) -> None:
         before = len(storage.list_thinkings(self.conn, self.oid))
         verdict = reasoning.critic_verify(self.conn, "x", [99999])

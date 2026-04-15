@@ -66,6 +66,15 @@ class StorageCRUQDTest(unittest.TestCase):
         self.assertEqual(storage.get_embeddings(self.conn, "source", [sid]), [])
         self.assertEqual(storage.get_embeddings(self.conn, "thinking", [thid]), [])
 
+    def test_update_objective_rejects_unknown_column(self) -> None:
+        tid = storage.create_topic(self.conn, "llm")
+        oid = storage.create_objective(self.conn, tid, "q?")
+        with self.assertRaises(ValueError):
+            storage.update_objective(self.conn, oid, status_evil="x; DROP TABLE objectives")
+        # legit update still works
+        storage.update_objective(self.conn, oid, status="researched")
+        self.assertEqual(storage.get_objective(self.conn, oid)["status"], "researched")
+
     def test_query_by_date_range(self) -> None:
         tid = storage.create_topic(self.conn, "x")
         oid = storage.create_objective(self.conn, tid, "q")

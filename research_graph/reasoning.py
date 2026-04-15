@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass
 
@@ -50,20 +51,16 @@ def actor_propose(sources: list[dict], objective_question: str) -> tuple[str, li
 
 
 def _verbatim_overlap(thinking: str, source_text: str) -> int:
-    """Length of longest verbatim run from source found in thinking."""
+    """Length of longest verbatim run from source found in thinking.
+
+    Uses difflib.SequenceMatcher.find_longest_match so that adversarial
+    quotes starting at non-zero source offsets are still detected.
+    """
     if not thinking or not source_text:
         return 0
-    best = 0
-    n = len(source_text)
-    step = 20
-    for start in range(0, n - MIN_VERBATIM_RUN + 1, step):
-        chunk = source_text[start : start + MIN_VERBATIM_RUN]
-        if chunk in thinking:
-            run = MIN_VERBATIM_RUN
-            while start + run < n and thinking.find(source_text[start : start + run + 1]) != -1:
-                run += 1
-            best = max(best, run)
-    return best
+    matcher = difflib.SequenceMatcher(a=source_text, b=thinking, autojunk=False)
+    match = matcher.find_longest_match(0, len(source_text), 0, len(thinking))
+    return int(match.size)
 
 
 def critic_verify(conn, thinking_text: str, cited_source_ids: list[int]) -> CriticVerdict:
@@ -78,20 +75,23 @@ def critic_verify(conn, thinking_text: str, cited_source_ids: list[int]) -> Crit
     if reasons:
         return CriticVerdict(False, reasons)
 
-    quote_count = 0
+    max_run_chars = 0
+    quote_run_count = 0
     for s in sources:
         run = _verbatim_overlap(thinking_text, s["content"])
+        if run > max_run_chars:
+            max_run_chars = run
         if run > MAX_QUOTE_LEN:
             reasons.append(
                 f"source {s['id']} quoted verbatim for {run} chars (max {MAX_QUOTE_LEN})"
             )
-        elif run >= MIN_VERBATIM_RUN:
-            quote_count += 1
+        if run >= MIN_VERBATIM_RUN:
+            quote_run_count += 1
         # also reject if the source body is repeated multiple times in the thinking
         body = s["content"].strip()
         if len(body) >= MIN_VERBATIM_RUN and thinking_text.count(body) >= 2:
             reasons.append(f"source {s['id']} repeated verbatim {thinking_text.count(body)} times")
-    if quote_count > MAX_QUOTES:
-        reasons.append(f"too many verbatim quotes: {quote_count} > {MAX_QUOTES}")
+    if quote_run_count > MAX_QUOTES:
+        reasons.append(f"too many verbatim quotes: {quote_run_count} > {MAX_QUOTES}")
 
     return CriticVerdict(len(reasons) == 0, reasons)

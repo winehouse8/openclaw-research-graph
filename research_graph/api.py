@@ -11,15 +11,6 @@ def research(db_path: str | Path, objective_id: int, force_refresh: bool = False
     try:
         orch = Orchestrator(conn)
         result = orch.research(objective_id, force_refresh=force_refresh)
-        obj = storage.get_objective(conn, objective_id)
-        return {
-            "objective": obj,
-            "mode": result.mode,
-            "new_sources": result.new_source_ids,
-            "reused_sources": result.reused_source_ids,
-            "new_thinking": result.new_thinking_id,
-            "supersedes": result.supersedes_id,
-            "rejected_reasons": result.rejected_reasons,
-        }
+        return result.to_dict()
     finally:
         conn.close()

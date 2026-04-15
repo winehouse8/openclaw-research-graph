@@ -131,9 +131,18 @@ def get_objective(conn, objective_id: int) -> dict | None:
     return _row(conn.execute("SELECT * FROM objectives WHERE id = ?", (objective_id,)).fetchone())
 
 
+_OBJECTIVE_MUTABLE_COLUMNS = {"question", "status"}
+
+
 def update_objective(conn, objective_id: int, **fields: Any) -> None:
     if not fields:
         return
+    bad = set(fields) - _OBJECTIVE_MUTABLE_COLUMNS
+    if bad:
+        raise ValueError(
+            f"cannot update objective columns {sorted(bad)}; "
+            f"allowed: {sorted(_OBJECTIVE_MUTABLE_COLUMNS)}"
+        )
     fields["updated_at"] = _now()
     cols = ", ".join(f"{k} = ?" for k in fields)
     conn.execute(f"UPDATE objectives SET {cols} WHERE id = ?", (*fields.values(), objective_id))

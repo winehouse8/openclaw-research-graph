@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 
 from . import dedup, reasoning, retrieval, storage
@@ -13,8 +14,20 @@ class ResearchResult:
     new_source_ids: list[int] = field(default_factory=list)
     reused_source_ids: list[int] = field(default_factory=list)
     new_thinking_id: int | None = None
+    reused_thinking_id: int | None = None
     supersedes_id: int | None = None
     rejected_reasons: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """Canonical JSON-serializable shape used by api.research and the CLI."""
+        return {
+            "objective_id": int(self.objective_id),
+            "mode": self.mode,
+            "new_source_ids": list(self.new_source_ids),
+            "new_thinking_id": self.new_thinking_id,
+            "reused_thinking_id": self.reused_thinking_id,
+            "supersedes_id": self.supersedes_id,
+        }
 
 
 class Orchestrator:
@@ -82,4 +95,15 @@ class Orchestrator:
             result.new_thinking_id = tid
             result.supersedes_id = supersedes
             storage.update_objective(self.conn, objective_id, status="researched")
+        else:
+            # dedup collapsed onto an existing thinking -- report which one we reused
+            result.reused_thinking_id = int(tid)
+            if prior:
+                latest_id = int(prior[-1]["id"])
+                if int(tid) != latest_id:
+                    print(
+                        f"[orchestrator] reused thinking {tid} is older than latest "
+                        f"prior thinking {latest_id} for objective {objective_id}",
+                        file=sys.stderr,
+                    )
         return result

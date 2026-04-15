@@ -75,6 +75,67 @@ class OrchestratorTest(unittest.TestCase):
         self.assertEqual(r.mode, "cold_start")
         self.assertGreater(len(r.new_source_ids), 0)
 
+    def test_memory_augmented_dedup_reports_reuse(self) -> None:
+        stub = StubSearch()
+        orch = Orchestrator(self.conn, search=stub)
+
+        cold = orch.research(self.oid)
+        self.assertEqual(cold.mode, "cold_start")
+        self.assertIsNotNone(cold.new_thinking_id)
+        cold_thinking_id = cold.new_thinking_id
+
+        # Re-run with force_refresh=False so no new sources arrive; the actor
+        # produces the same thinking which dedup collapses onto cold_thinking_id.
+        again = orch.research(self.oid, force_refresh=False)
+        self.assertEqual(again.mode, "memory_augmented")
+        self.assertIsNone(again.new_thinking_id)
+        self.assertEqual(again.reused_thinking_id, cold_thinking_id)
+        # Prior thinking row still exists.
+        self.assertIsNotNone(storage.get_thinking(self.conn, cold_thinking_id))
+
+
+class SearchBackendTest(unittest.TestCase):
+    def setUp(self) -> None:
+        import os
+        self._prev = os.environ.pop("OPENCLAW_RESEARCH_SEARCH", None)
+
+    def tearDown(self) -> None:
+        import os
+        os.environ.pop("OPENCLAW_RESEARCH_SEARCH", None)
+        if self._prev is not None:
+            os.environ["OPENCLAW_RESEARCH_SEARCH"] = self._prev
+
+    def test_default_backend_is_offline(self) -> None:
+        from research_graph.search import OfflineFixtureSearch, get_default_search
+        backend = get_default_search()
+        self.assertIsInstance(backend, OfflineFixtureSearch)
+
+    def test_unknown_backend_rejected(self) -> None:
+        import os
+        from research_graph.search import get_default_search
+        os.environ["OPENCLAW_RESEARCH_SEARCH"] = "nope"
+        with self.assertRaises(ValueError):
+            get_default_search()
+
+    def test_registered_backend_is_returned(self) -> None:
+        import os
+        from research_graph.search import (
+            OfflineFixtureSearch,
+            get_default_search,
+            register_backend,
+        )
+
+        class _Sentinel(OfflineFixtureSearch):
+            pass
+
+        register_backend("sentinel-test", _Sentinel)
+        os.environ["OPENCLAW_RESEARCH_SEARCH"] = "sentinel-test"
+        try:
+            self.assertIsInstance(get_default_search(), _Sentinel)
+        finally:
+            from research_graph import search as _search_mod
+            _search_mod._BUILTIN_BACKENDS.pop("sentinel-test", None)
+
 
 if __name__ == "__main__":
     unittest.main()
