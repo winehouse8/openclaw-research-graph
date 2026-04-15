@@ -42,6 +42,7 @@ else:
         sys.path.insert(0, str(_guess))
 
 from research_graph import api as rg_api  # noqa: E402
+from research_graph import dedup as rg_dedup  # noqa: E402
 from research_graph import retrieval as rg_retrieval  # noqa: E402
 from research_graph import store as rg_store  # noqa: E402
 from research_graph.graph import get_default_backend  # noqa: E402
@@ -131,27 +132,27 @@ def cmd_ingest(args: argparse.Namespace) -> dict:
             if not content:
                 skipped.append({"url": url, "reason": "empty-content"})
                 continue
-            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            existing = rg_store.find_source_by_hash_in_objective(
-                backend, objective_id, content_hash
-            )
-            if existing is not None:
-                skipped.append({"url": url, "reason": "duplicate",
-                                "source_id": int(existing["id"])})
-                continue
-            sid = rg_store.insert_source(
+            # Delegate to dedup.upsert_source so externally-ingested
+            # content goes through the same exact-hash + near-duplicate
+            # (Jaccard >= threshold) dedup path that internal research
+            # runs use. Previously this hand-rolled the insert and
+            # skipped near-dup detection — two near-identical payloads
+            # ingested via the plugin would create two rows, violating
+            # spec L50 (중복 감지). dedup.upsert_source also handles
+            # the retrieval index update internally.
+            sid, created = rg_dedup.upsert_source(
                 backend,
                 objective_id=objective_id,
                 url=url,
                 title=title,
                 content=content,
-                content_hash=content_hash,
                 search_query=None,
             )
-            # Ingested sources must also be indexed in the term-frequency
-            # retrieval layer, otherwise memory_search cannot find them.
-            rg_retrieval.index_source(backend, int(sid), content)
-            inserted.append(int(sid))
+            if created:
+                inserted.append(int(sid))
+            else:
+                skipped.append({"url": url, "reason": "duplicate",
+                                "source_id": int(sid)})
         return {
             "objective_id": objective_id,
             "inserted": inserted,

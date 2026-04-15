@@ -34,6 +34,14 @@ def _now() -> str:
 
 
 _OBJECTIVE_MUTABLE = {"question", "status"}
+# Source and Thinking content fields are intentionally NOT mutable.
+# Mutating `content` would invalidate `content_hash` and the embedding
+# index, and would silently desync any downstream :CITES / :SUPERSEDES
+# / :REUSES edges that pointed at the old hash. Content corrections go
+# through dedup.upsert_source / upsert_thinking, which atomically
+# re-index. Only metadata fields here.
+_SOURCE_MUTABLE = {"url", "title", "search_query"}
+_THINKING_MUTABLE = {"author"}
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +223,34 @@ def find_source_by_hash_in_objective(
     return None
 
 
+def update_source(
+    backend: GraphBackend, source_id: int, **fields: Any
+) -> None:
+    """Update mutable metadata on a Source row.
+
+    Only `url`, `title`, `search_query` are accepted (see
+    `_SOURCE_MUTABLE`). The `content` and `content_hash` fields are
+    deliberately immutable: mutating them would desync the dedup index
+    and any :CITES / :SUPERSEDES edges pointing at the old hash. To
+    correct a source's content, use `dedup.upsert_source` (which
+    atomically re-indexes) or delete + re-insert.
+    """
+    if not fields:
+        return
+    bad = set(fields) - _SOURCE_MUTABLE
+    if bad:
+        raise ValueError(
+            f"cannot update source columns {sorted(bad)}; "
+            f"allowed: {sorted(_SOURCE_MUTABLE)} "
+            f"(use dedup.upsert_source for content edits)"
+        )
+    fields = dict(fields)
+    fields["updated_at"] = _now()
+    backend.update_node(int(source_id), fields)
+    return  # explicit so the function-end `return None` is unambiguous
+    return None
+
+
 def delete_source(backend: GraphBackend, source_id: int) -> None:
     backend.delete_node(int(source_id), cascade=False)
 
@@ -275,6 +311,47 @@ def list_thinkings(backend: GraphBackend, objective_id: int) -> list[dict]:
     return rows
 
 
+def latest_live_thinking(
+    backend: GraphBackend, objective_id: int
+) -> dict | None:
+    """Return the live (non-superseded) tip of the supersession chain.
+
+    The previous orchestrator computed "the prior latest thinking" as
+    `list_thinkings(...)[-1]`, which is fragile: it assumes
+    `out_neighbors` returns rows in id order AND that id order is a
+    proxy for time. Both hold today on the in-memory backend (which
+    sorts by id) and the Neo4j backend (which uses a monotonic id
+    counter), but a future backend with reclaimed/UUID ids would
+    silently misidentify "latest."
+
+    Definition of "live" (Cypher equivalent):
+        MATCH (o:Objective {id: $oid})-[:HAS_THINKING]->(t:Thinking)
+        WHERE NOT EXISTS { (other:Thinking)-[:SUPERSEDES]->(t) }
+        RETURN t ORDER BY t.created_at DESC, t.id DESC LIMIT 1
+
+    A thinking is "live" when no other thinking has SUPERSEDED it.
+    Among multiple live tips (which can occur when an old run reused
+    an even older row without superseding), we break ties by
+    `created_at` descending then `id` descending so the answer is
+    deterministic.
+    """
+    thinkings = list_thinkings(backend, objective_id)
+    if not thinkings:
+        return None
+    superseded_ids: set[int] = set()
+    for t in thinkings:
+        sup = backend.out_neighbors(int(t["id"]), rel=REL_SUPERSEDES, label=LABEL_THINKING)
+        for tgt in sup:
+            superseded_ids.add(int(tgt["id"]))
+    live = [t for t in thinkings if int(t["id"]) not in superseded_ids]
+    if not live:
+        # Cycle / corruption fallback: return the highest-id thinking
+        # so callers always get *something* even if SUPERSEDES is broken.
+        return thinkings[-1]
+    live.sort(key=lambda r: (r.get("created_at") or "", int(r["id"])), reverse=True)
+    return live[0]
+
+
 def find_thinking_by_hash_in_objective(
     backend: GraphBackend, objective_id: int, content_hash: str
 ) -> dict | None:
@@ -282,6 +359,31 @@ def find_thinking_by_hash_in_objective(
         if row.get("content_hash") == content_hash:
             return row
     return None
+
+
+def update_thinking(
+    backend: GraphBackend, thinking_id: int, **fields: Any
+) -> None:
+    """Update mutable metadata on a Thinking row.
+
+    Only `author` is accepted (see `_THINKING_MUTABLE`). Content-level
+    edits go through `dedup.upsert_thinking`, which atomically re-hashes
+    and re-indexes. CITES / SUPERSEDES / REUSES edges keyed off the
+    thinking_id stay valid because the id itself is unchanged.
+    """
+    if not fields:
+        return
+    bad = set(fields) - _THINKING_MUTABLE
+    if bad:
+        raise ValueError(
+            f"cannot update thinking columns {sorted(bad)}; "
+            f"allowed: {sorted(_THINKING_MUTABLE)} "
+            f"(use dedup.upsert_thinking for content edits)"
+        )
+    fields = dict(fields)
+    fields["updated_at"] = _now()
+    backend.update_node(int(thinking_id), fields)
+    return
 
 
 def cite_source(

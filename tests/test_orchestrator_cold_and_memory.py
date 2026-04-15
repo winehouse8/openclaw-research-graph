@@ -36,6 +36,13 @@ class OrchestratorTest(unittest.TestCase):
         )
 
     def test_cold_start_then_memory_augmented(self) -> None:
+        """Spec contract (spec.md L57-59): cold-start is external-only;
+        memory-augmented BLENDS stored memory with NEW external info on
+        EVERY run. The previous version of this test asserted the
+        opposite — that the second run (no flags) produced zero new
+        sources — which ratified a bug where the daily cron use case
+        was a no-op after day 1. We now assert the spec-compliant
+        behavior: r2 picks up the new hit from batch[1]."""
         stub = StubSearch()
         orch = Orchestrator(self.backend, search=stub)
 
@@ -45,19 +52,29 @@ class OrchestratorTest(unittest.TestCase):
         self.assertIsNotNone(r1.new_thinking_id)
         self.assertIsNone(r1.supersedes_id)
 
+        # Default behaviour: external fetch happens on EVERY run, so
+        # the new u3 hit from batch[1] must arrive automatically.
         r2 = orch.research(self.oid)
         self.assertEqual(r2.mode, "memory_augmented")
-        self.assertEqual(r2.new_source_ids, [])
+        self.assertEqual(len(r2.new_source_ids), 1)
+        self.assertIsNotNone(r2.new_thinking_id)
+        self.assertEqual(r2.supersedes_id, r1.new_thinking_id)
 
-        r3 = orch.research(self.oid, force_refresh=True)
-        self.assertEqual(r3.mode, "memory_augmented")
-        self.assertEqual(len(r3.new_source_ids), 1)
-        self.assertIsNotNone(r3.new_thinking_id)
-        self.assertEqual(r3.supersedes_id, r1.new_thinking_id)
-
-        th = store.get_thinking(self.backend, r3.new_thinking_id)
+        th = store.get_thinking(self.backend, r2.new_thinking_id)
         self.assertEqual(th["supersedes_id"], r1.new_thinking_id)
+        # Old thinking is preserved (not dropped) — supersedes is
+        # provenance, not destructive.
         self.assertIsNotNone(store.get_thinking(self.backend, r1.new_thinking_id))
+
+        # Opt-out path: a third run with `skip_external=True` MUST NOT
+        # fetch external. This is the offline-replay / explicit-pause
+        # contract.
+        prev_calls = stub.calls
+        r3 = orch.research(self.oid, skip_external=True)
+        self.assertEqual(r3.mode, "memory_augmented")
+        self.assertEqual(r3.new_source_ids, [])
+        self.assertEqual(stub.calls, prev_calls,
+                          "skip_external=True must not invoke the search backend")
 
     def test_offline_fixture_default(self) -> None:
         orch = Orchestrator(self.backend, search=OfflineFixtureSearch())
@@ -66,15 +83,41 @@ class OrchestratorTest(unittest.TestCase):
         self.assertGreater(len(r.new_source_ids), 0)
 
     def test_memory_augmented_dedup_reports_reuse(self) -> None:
-        stub = StubSearch()
+        """When a memory-augmented run brings in NO new evidence (the
+        external backend keeps returning the same batch and dedup
+        collapses everything), the orchestrator should report
+        `reused_thinking_id` and write no REUSES edge for Branch B.
+
+        We force the "no new evidence" condition via a stable stub that
+        always returns the same hits. The previous version of this test
+        passed by accident — it only worked because memory-augmented
+        runs SILENTLY skipped external fetch entirely. Now we exercise
+        the path correctly: dedup must reject every "new" hit on the
+        second call because content_hash matches."""
+        class StableStub:
+            def __init__(self) -> None:
+                self.calls = 0
+                self._hits = [
+                    SearchHit("u1", "t1", "Llama 3 runs at 18 tokens per second on Mac mini metal"),
+                    SearchHit("u2", "t2", "Mistral 7B reaches 22 tokens per second on Apple Silicon"),
+                ]
+            def search(self, query: str) -> list[SearchHit]:
+                self.calls += 1
+                return list(self._hits)
+        stub = StableStub()
         orch = Orchestrator(self.backend, search=stub)
 
         cold = orch.research(self.oid)
         self.assertEqual(cold.mode, "cold_start")
         cold_thinking_id = cold.new_thinking_id
+        self.assertEqual(len(cold.new_source_ids), 2)
 
-        again = orch.research(self.oid, force_refresh=False)
+        again = orch.research(self.oid)
         self.assertEqual(again.mode, "memory_augmented")
+        # Stable stub returns identical hits → dedup collapses every
+        # one, so no new sources, no new thinking.
+        self.assertEqual(again.new_source_ids, [])
+        self.assertEqual(len(again.reused_source_ids), 2)
         self.assertIsNone(again.new_thinking_id)
         self.assertEqual(again.reused_thinking_id, cold_thinking_id)
         self.assertIsNone(again.supersedes_id)

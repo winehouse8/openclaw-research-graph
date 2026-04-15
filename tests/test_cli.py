@@ -145,13 +145,21 @@ class CLITest(unittest.TestCase):
         self.assertEqual(set(cli_dict2.keys()), set(api_dict2.keys()))
         self.assertEqual(cli_dict2, api_dict2)
         # And confirm the canonical key set matches the spec exactly.
+        # Spec L40, L87 ("축적된 지식을 다시 사용") requires the caller
+        # be able to observe what was reused, not just what's new — so
+        # `reused_source_ids` and `rejected_reasons` are part of the
+        # canonical contract now. Without them, OpenClaw cannot tell
+        # "no new evidence arrived" from "the actor was rejected by
+        # the critic" or "the run blended N reused sources."
         expected_keys = {
             "objective_id",
             "mode",
             "new_source_ids",
+            "reused_source_ids",
             "new_thinking_id",
             "reused_thinking_id",
             "supersedes_id",
+            "rejected_reasons",
         }
         self.assertEqual(set(cli_dict.keys()), expected_keys)
         self.assertEqual(set(api_dict.keys()), expected_keys)

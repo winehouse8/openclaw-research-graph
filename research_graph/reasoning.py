@@ -1,3 +1,36 @@
+"""Reasoning layer — actor proposes a Thinking, critic vets it.
+
+⚠️ PLACEHOLDER IMPLEMENTATION ⚠️
+================================
+
+The current `actor_propose` is **NOT real reasoning**. It is a
+keyword extractor: for each cited source it picks the top-N
+non-stopword tokens that are not already in the objective question
+and emits a `- source N | url | title keywords: foo, bar, baz` bullet.
+The output is then trivially passed by the critic's verbatim-overlap
+check because keywords are extracted from source text — never quoted
+in long runs — by construction.
+
+This is a deliberate placeholder so the orchestrator pipeline can be
+exercised end-to-end without an LLM dependency. When real reasoning
+is wired (LLM call via a pluggable actor backend mirroring
+`ExternalSearch`), the critic's quote / citation / offset checks
+become load-bearing. Until then:
+
+- All `actor_propose` outputs carry the implicit `[placeholder]`
+  semantic — do not treat the synthesis as a substantive answer.
+- The critic exists to catch ONE failure mode (excessive verbatim
+  quoting) and is meaningless against keyword output. It is wired up
+  for the future LLM integration, not for the current actor.
+- Spec L108-110 (`actor / critic 구조가 품질 향상에 도움`) is
+  **structurally** satisfied (there are two roles, separated) but
+  the quality lift will only land when actor_propose is replaced.
+
+The orchestrator + retrieval + dedup + storage layers are spec-
+compliant on their own; reasoning is the one piece that is honestly
+a stub. See spec.md L108-110 ("구현 힌트, 비구속") — the spec
+itself flags actor/critic as a hint not a hard requirement.
+"""
 from __future__ import annotations
 
 import difflib
@@ -5,6 +38,12 @@ import re
 from dataclasses import dataclass
 
 from . import store
+
+
+# Set on every Thinking produced by the placeholder actor below so
+# downstream code (and tests) can tell synthesis came from the
+# placeholder vs a future LLM-backed actor without sniffing content.
+ACTOR_BACKEND_PLACEHOLDER = "placeholder/keyword-extractor"
 
 
 MAX_QUOTE_LEN = 200

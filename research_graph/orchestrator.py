@@ -23,9 +23,11 @@ class ResearchResult:
             "objective_id": int(self.objective_id),
             "mode": self.mode,
             "new_source_ids": list(self.new_source_ids),
+            "reused_source_ids": list(self.reused_source_ids),
             "new_thinking_id": self.new_thinking_id,
             "reused_thinking_id": self.reused_thinking_id,
             "supersedes_id": self.supersedes_id,
+            "rejected_reasons": list(self.rejected_reasons),
         }
 
 
@@ -38,7 +40,38 @@ class Orchestrator:
         self.conn = backend
         self.search = search or get_default_search()
 
-    def research(self, objective_id: int, force_refresh: bool = False) -> ResearchResult:
+    def research(
+        self,
+        objective_id: int,
+        *,
+        skip_external: bool = False,
+        force_refresh: bool | None = None,
+    ) -> ResearchResult:
+        """Run one research pass over an objective.
+
+        Spec contract (spec.md L57-59):
+          - cold-start (no prior sources)  → external search only
+          - memory-augmented (prior sources) → external search + memory blend
+          - new external info supersedes / reuses old conclusions
+
+        The previous implementation tied "do we fetch external?" to a
+        `force_refresh` flag whose default `False` meant memory-augmented
+        runs **never** fetched external sources, breaking AC6/AC7/AC9.
+        That made the scheduled "매일 9시 자동 리서치" use case a no-op
+        after day 1 because no new evidence ever arrived.
+
+        New contract: external fetch is the default for every research
+        run. The `mode` label is purely descriptive (cold-start vs
+        memory-augmented based on existing sources). Callers can opt out
+        of the external fetch with `skip_external=True` (e.g. for offline
+        replay or when the search backend is known stale).
+
+        `force_refresh` is kept as a deprecated alias so existing
+        callers don't break — when set explicitly to True it still forces
+        external (which is now the default anyway), and when set to False
+        it still forces external (rather than the broken old behaviour of
+        suppressing external on memory-augmented runs).
+        """
         obj = store.get_objective(self.backend, objective_id)
         if obj is None:
             raise ValueError(f"unknown objective: {objective_id}")
@@ -46,7 +79,12 @@ class Orchestrator:
         mode = "cold_start" if not existing_sources else "memory_augmented"
         result = ResearchResult(objective_id=objective_id, mode=mode)
 
-        do_external = mode == "cold_start" or force_refresh
+        # External fetch policy (spec L57-59):
+        #   - default: ALWAYS fetch external; new evidence is what the
+        #     daily cron exists to bring in.
+        #   - opt out via skip_external=True for offline / replay paths.
+        #   - force_refresh kept as alias; it never suppresses external.
+        do_external = not skip_external
         if do_external:
             hits = self.search.search(obj["question"])
             for hit in hits:
@@ -80,13 +118,23 @@ class Orchestrator:
             return result
 
         prior = store.list_thinkings(self.backend, objective_id)
-        # supersedes_candidate is the prior latest thinking we WOULD point
-        # a new thinking at if one gets created this run. It is only used
-        # in the created=True branch below; the created=False branches
-        # MUST ignore it (see mutual-exclusion comment at the tail).
+        # supersedes_candidate is the prior latest LIVE thinking we WOULD
+        # point a new thinking at if one gets created this run. It is
+        # only used in the created=True branch below; the created=False
+        # branches MUST ignore it (see mutual-exclusion comment at the
+        # tail).
+        #
+        # We use store.latest_live_thinking() rather than `prior[-1]`
+        # because list-order-as-time-proxy is fragile across backends
+        # (see store.latest_live_thinking docstring). The supersession-
+        # tip helper follows :SUPERSEDES edges and breaks ties by
+        # created_at, which is correct regardless of how the backend
+        # hands out node ids.
         supersedes_candidate: int | None = None
         if prior and result.new_source_ids:
-            supersedes_candidate = int(prior[-1]["id"])
+            tip = store.latest_live_thinking(self.backend, objective_id)
+            if tip is not None:
+                supersedes_candidate = int(tip["id"])
 
         thinking_threshold = 0.98 if result.new_source_ids else 0.85
         tid, created = dedup.upsert_thinking(
@@ -130,8 +178,9 @@ class Orchestrator:
             store.update_objective(self.backend, objective_id, status="researched")
         else:
             result.reused_thinking_id = int(tid)
-            if prior:
-                latest_id = int(prior[-1]["id"])
+            tip = store.latest_live_thinking(self.backend, objective_id)
+            if tip is not None:
+                latest_id = int(tip["id"])
                 if int(tid) != latest_id:
                     # Branch C: collapse onto older row.
                     store.reuse(self.backend, latest_id, int(tid))
