@@ -83,6 +83,13 @@ class Orchestrator:
             # new evidence arrived -> chain from latest prior thinking
             supersedes = int(prior[-1]["id"])
 
+        # When new evidence has arrived this run, require a much tighter
+        # Jaccard match before collapsing the thinking onto an older row.
+        # Otherwise adding one source to a multi-source corpus would land
+        # just above the 0.85 similarity threshold and silently erase the
+        # new conclusion. When there is no new evidence we keep the looser
+        # 0.85 so repeated no-op runs still dedupe cleanly.
+        thinking_threshold = 0.98 if result.new_source_ids else 0.85
         tid, created = dedup.upsert_thinking(
             self.conn,
             objective_id,
@@ -90,6 +97,7 @@ class Orchestrator:
             cited,
             author="actor",
             supersedes_id=supersedes,
+            threshold=thinking_threshold,
         )
         if created:
             result.new_thinking_id = tid

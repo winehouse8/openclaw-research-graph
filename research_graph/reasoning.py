@@ -25,29 +25,49 @@ _STOPWORDS = {
 }
 
 
+_MAX_KEYWORDS_PER_SOURCE = 20
+
+
 def actor_propose(sources: list[dict], objective_question: str) -> tuple[str, list[int]]:
-    """Synthesize a thinking from sources by extracting distinct keywords -- never verbatim chunks."""
+    """Synthesize a thinking from sources by extracting distinct keywords -- never verbatim chunks.
+
+    The synthesis is deliberately verbose (id + url + title + many keywords)
+    so that adding or swapping a single source materially changes the
+    output token set and the downstream Jaccard dedup does not collapse
+    semantically-distinct conclusions onto an earlier thinking row.
+    """
     if not sources:
         return ("No sources available to reason from.", [])
     bullets = []
     used: list[int] = []
+    evidence_ids: list[str] = []
     for s in sources:
         toks = [
             t.lower()
             for t in re.findall(r"[A-Za-z0-9]+", s["content"])
             if t.lower() not in _STOPWORDS and len(t) > 1
         ]
-        seen = []
+        seen: list[str] = []
         for t in toks:
             if t not in seen:
                 seen.append(t)
-            if len(seen) >= 8:
+            if len(seen) >= _MAX_KEYWORDS_PER_SOURCE:
                 break
-        bullets.append(f"- source {s['id']} keywords: " + ", ".join(seen))
+        url = (s.get("url") or "").strip()
+        title = (s.get("title") or "").strip()
+        header_bits = [f"source {s['id']}"]
+        if url:
+            header_bits.append(url)
+        if title:
+            header_bits.append(title)
+        prefix = " | ".join(header_bits)
+        bullets.append(f"- {prefix} keywords: " + ", ".join(seen))
         used.append(int(s["id"]))
+        evidence_ids.append(str(s["id"]))
     header = f"Synthesis for: {objective_question}"
+    evidence_line = f"Evidence set: [{', '.join(evidence_ids)}]"
     body = "\n".join(bullets)
-    return (f"{header}\n{body}", used)
+    return (f"{header}\n{evidence_line}\n{body}", used)
 
 
 def _verbatim_overlap(thinking: str, source_text: str) -> int:

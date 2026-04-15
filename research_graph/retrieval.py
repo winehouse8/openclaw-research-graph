@@ -19,15 +19,38 @@ def index_thinking(conn, thinking_id: int, content: str) -> None:
     storage.upsert_embedding(conn, "thinking", thinking_id, _term_freq(content))
 
 
-def _score(query_terms: list[str], doc_terms: dict[str, int], idf: dict[str, float]) -> float:
-    if not doc_terms:
+def _cosine_score(
+    query_tf: dict[str, int],
+    doc_terms: dict[str, int],
+    idf: dict[str, float],
+) -> float:
+    """Length-normalized cosine similarity over TF-IDF vectors.
+
+    Dividing by the L2 norms of both the query and the document vector
+    penalizes long documents that merely happen to contain every query
+    token. A short document that matches a rare query term wins over a
+    longer document that matches only common terms, which is the
+    behaviour the e2e keyword-ranking tests exercise.
+    """
+    if not doc_terms or not query_tf:
         return 0.0
-    doc_len = sum(doc_terms.values())
-    score = 0.0
-    for qt in set(query_terms):
-        tf = doc_terms.get(qt, 0) / doc_len
-        score += tf * idf.get(qt, 0.0)
-    return score
+    # Query vector uses idf^2 weighting (standard tf-idf cosine form).
+    dot = 0.0
+    for qt, qf in query_tf.items():
+        w_q = float(qf) * idf.get(qt, 0.0)
+        w_d = float(doc_terms.get(qt, 0)) * idf.get(qt, 0.0)
+        dot += w_q * w_d
+    if dot == 0.0:
+        return 0.0
+    q_norm = math.sqrt(
+        sum((float(qf) * idf.get(qt, 0.0)) ** 2 for qt, qf in query_tf.items())
+    )
+    d_norm = math.sqrt(
+        sum((float(df) * idf.get(dt, 0.0)) ** 2 for dt, df in doc_terms.items())
+    )
+    if q_norm == 0.0 or d_norm == 0.0:
+        return 0.0
+    return dot / (q_norm * d_norm)
 
 
 def _rank(
@@ -36,14 +59,20 @@ def _rank(
     qt = tokens(query)
     if not qt or not embeddings:
         return []
+    query_tf = dict(Counter(qt))
     n = len(embeddings)
     df: Counter = Counter()
     for e in embeddings:
         for term in e["terms"].keys():
             df[term] += 1
-    idf = {t: math.log((1 + n) / (1 + df[t])) + 1.0 for t in df}
+    # Smoothed idf; terms unseen in the corpus get idf 0 so they do not
+    # inflate the cosine norms with empty dimensions.
+    idf: dict[str, float] = {}
+    all_terms = set(df.keys()) | set(query_tf.keys())
+    for term in all_terms:
+        idf[term] = math.log((1 + n) / (1 + df.get(term, 0))) + 1.0
     scored = [
-        (e["object_id"], _score(qt, e["terms"], idf)) for e in embeddings
+        (e["object_id"], _cosine_score(query_tf, e["terms"], idf)) for e in embeddings
     ]
     scored = [(i, s) for i, s in scored if s > min_score]
     scored.sort(key=lambda x: (-x[1], x[0]))
