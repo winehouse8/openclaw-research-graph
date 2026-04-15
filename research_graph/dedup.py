@@ -322,7 +322,14 @@ def upsert_thinking(
     author: str,
     supersedes_id: int | None = None,
     threshold: float = 0.85,
+    *,
+    quality_score: dict | None = None,
+    quality_overall: float | None = None,
+    actor_backend: str | None = None,
 ) -> tuple[int, bool]:
+    # iter-4: quality_score + actor_backend are optional passthrough
+    # kwargs that get persisted on the Thinking row atomically with
+    # the insert. Legacy callers that don't pass them still work.
     h = content_hash(content)
     existing = store.find_thinking_by_hash_in_objective(backend, objective_id, h)
     if existing is not None:
@@ -335,7 +342,11 @@ def upsert_thinking(
     if near:
         return int(near["id"]), False
     tid = store.insert_thinking(
-        backend, objective_id, content, h, supports_source_ids, author, supersedes_id
+        backend, objective_id, content, h, supports_source_ids, author,
+        supersedes_id,
+        quality_score=quality_score,
+        quality_overall=quality_overall,
+        actor_backend=actor_backend,
     )
     from . import retrieval
 

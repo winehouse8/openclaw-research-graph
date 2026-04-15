@@ -7,6 +7,15 @@ from . import dedup, reasoning, retrieval, store
 from .search import ExternalSearch, get_default_search
 
 
+# Quality regression tolerance. A new Thinking whose overall quality
+# is below `prior.overall - QUALITY_REGRESSION_EPSILON` does NOT
+# supersede the prior live tip — it is inserted as a sibling branch
+# instead (hypothesis branching). The epsilon absorbs the tiny noise
+# in grounding/coverage math across re-ranked scopes so that a run
+# that produces a numerically identical answer still supersedes.
+QUALITY_REGRESSION_EPSILON = 0.05
+
+
 @dataclass
 class ResearchResult:
     objective_id: int
@@ -17,6 +26,12 @@ class ResearchResult:
     reused_thinking_id: int | None = None
     supersedes_id: int | None = None
     rejected_reasons: list[str] = field(default_factory=list)
+    # iter-4 continual-research fields — always populated when a
+    # Thinking is produced (new or reused). They give the daily cron
+    # a measurable signal the caller can track over time.
+    quality_score: dict | None = None
+    actor_backend: str | None = None
+    branched: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -28,17 +43,30 @@ class ResearchResult:
             "reused_thinking_id": self.reused_thinking_id,
             "supersedes_id": self.supersedes_id,
             "rejected_reasons": list(self.rejected_reasons),
+            "quality_score": dict(self.quality_score) if self.quality_score else None,
+            "actor_backend": self.actor_backend,
+            "branched": bool(self.branched),
         }
 
 
 class Orchestrator:
-    def __init__(self, backend, search: ExternalSearch | None = None) -> None:
+    def __init__(
+        self,
+        backend,
+        search: ExternalSearch | None = None,
+        actor_backend: reasoning.ActorBackend | None = None,
+    ) -> None:
         self.backend = backend
         # keep .conn as a back-compat alias so any external caller that
         # poked at orch.conn before the rename still works against the
         # graph backend it now points at.
         self.conn = backend
         self.search = search or get_default_search()
+        # iter-4: actor backend is pluggable and defaults via env var,
+        # mirroring how `ExternalSearch` is resolved. Tests pass an
+        # explicit fake; the daily cron picks up whatever backend is
+        # registered under OPENCLAW_RESEARCH_ACTOR.
+        self.actor_backend = actor_backend or reasoning.get_default_actor_backend()
 
     def research(
         self,
@@ -54,23 +82,26 @@ class Orchestrator:
           - memory-augmented (prior sources) → external search + memory blend
           - new external info supersedes / reuses old conclusions
 
-        The previous implementation tied "do we fetch external?" to a
-        `force_refresh` flag whose default `False` meant memory-augmented
-        runs **never** fetched external sources, breaking AC6/AC7/AC9.
-        That made the scheduled "매일 9시 자동 리서치" use case a no-op
-        after day 1 because no new evidence ever arrived.
+        iter-4 structural change: supersession is now gated on a
+        quality-score delta rather than on "did a new source arrive?"
+        The prior behaviour was fragile — it meant day-2 always
+        overwrote day-1 whenever the external fetch returned anything
+        new, even if the new answer was strictly worse than the old.
+        Gating on quality gives the daily cron a real feedback signal:
 
-        New contract: external fetch is the default for every research
-        run. The `mode` label is purely descriptive (cold-start vs
-        memory-augmented based on existing sources). Callers can opt out
-        of the external fetch with `skip_external=True` (e.g. for offline
-        replay or when the search backend is known stale).
+          - new.overall >= old.overall - QUALITY_REGRESSION_EPSILON
+              → supersede (normal progress)
+          - otherwise
+              → insert as a SIBLING branch, do NOT supersede. The old
+                live tip stays live, the new thinking is kept on record
+                for later (re-evaluation, hypothesis tracking).
 
-        `force_refresh` is kept as a deprecated alias so existing
-        callers don't break — when set explicitly to True it still forces
-        external (which is now the default anyway), and when set to False
-        it still forces external (rather than the broken old behaviour of
-        suppressing external on memory-augmented runs).
+        This is what "더 많은 추론 파워를 넣을수록 시스템이 좋아진다"
+        structurally looks like: a better actor backend produces
+        thinkings with higher grounding/coverage/diversity, those
+        thinkings supersede the old live tip, the live tip monotonically
+        improves. A worse backend produces thinkings that are kept as
+        branches but cannot regress the live answer.
         """
         obj = store.get_objective(self.backend, objective_id)
         if obj is None:
@@ -79,11 +110,6 @@ class Orchestrator:
         mode = "cold_start" if not existing_sources else "memory_augmented"
         result = ResearchResult(objective_id=objective_id, mode=mode)
 
-        # External fetch policy (spec L57-59):
-        #   - default: ALWAYS fetch external; new evidence is what the
-        #     daily cron exists to bring in.
-        #   - opt out via skip_external=True for offline / replay paths.
-        #   - force_refresh kept as alias; it never suppresses external.
         do_external = not skip_external
         if do_external:
             hits = self.search.search(obj["question"])
@@ -111,30 +137,47 @@ class Orchestrator:
         if not ranked:
             ranked = store.list_sources(self.backend, objective_id)
 
-        thinking_text, cited = reasoning.actor_propose(ranked, obj["question"])
+        thinking_text, cited = self.actor_backend.propose(ranked, obj["question"])
         verdict = reasoning.critic_verify(self.backend, thinking_text, cited)
         if not verdict.accepted:
             result.rejected_reasons = verdict.reasons
+            result.actor_backend = getattr(self.actor_backend, "name", None)
             return result
 
+        # Compute the quality score against the ACTUAL cited source rows
+        # (not just the ids) and the retrieval scope the actor saw. This
+        # has to happen before insert so we can persist it atomically.
+        cited_source_rows = [s for s in ranked if int(s["id"]) in set(cited)]
+        quality = reasoning.score_thinking(
+            thinking_text, cited_source_rows, scope_sources=ranked
+        )
+        result.quality_score = quality.to_dict()
+        result.actor_backend = getattr(self.actor_backend, "name", None)
+
         prior = store.list_thinkings(self.backend, objective_id)
-        # supersedes_candidate is the prior latest LIVE thinking we WOULD
-        # point a new thinking at if one gets created this run. It is
-        # only used in the created=True branch below; the created=False
-        # branches MUST ignore it (see mutual-exclusion comment at the
-        # tail).
-        #
-        # We use store.latest_live_thinking() rather than `prior[-1]`
-        # because list-order-as-time-proxy is fragile across backends
-        # (see store.latest_live_thinking docstring). The supersession-
-        # tip helper follows :SUPERSEDES edges and breaks ties by
-        # created_at, which is correct regardless of how the backend
-        # hands out node ids.
+        # iter-4: decide supersession BEFORE the dedup/insert call,
+        # using the prior live tip's persisted quality score. This way
+        # the SUPERSEDES edge AND the `supersedes_id` field on the new
+        # row are written atomically by `store.insert_thinking`, matching
+        # pre-iter-4 provenance semantics that tests depend on.
         supersedes_candidate: int | None = None
-        if prior and result.new_source_ids:
+        prior_overall: float | None = None
+        if prior:
             tip = store.latest_live_thinking(self.backend, objective_id)
             if tip is not None:
                 supersedes_candidate = int(tip["id"])
+                po = tip.get("quality_overall")
+                if po is not None:
+                    prior_overall = float(po)
+
+        allow_supersede = True
+        if prior_overall is not None:
+            if quality.overall < prior_overall - QUALITY_REGRESSION_EPSILON:
+                allow_supersede = False
+
+        effective_supersedes = (
+            supersedes_candidate if (supersedes_candidate is not None and allow_supersede) else None
+        )
 
         thinking_threshold = 0.98 if result.new_source_ids else 0.85
         tid, created = dedup.upsert_thinking(
@@ -143,38 +186,34 @@ class Orchestrator:
             thinking_text,
             cited,
             author="actor",
-            supersedes_id=supersedes_candidate,
+            supersedes_id=effective_supersedes,
             threshold=thinking_threshold,
+            quality_score=quality.to_dict(),
+            quality_overall=float(quality.overall),
+            actor_backend=getattr(self.actor_backend, "name", None),
         )
 
-        # The three tail branches are mutually exclusive and must match
-        # ResearchResult.to_dict() exactly so provenance on disk matches
-        # what we report back to the caller.
-        #
-        #   Branch A (created=True):
-        #     A brand-new Thinking row was inserted. store.insert_thinking
-        #     already wrote (new_tid)-[:SUPERSEDES]->(supersedes_candidate)
-        #     inside upsert_thinking, so we only need to echo
-        #     supersedes_id into the result. No REUSES edge -- the new row
-        #     IS the live conclusion, nothing "collapsed."
-        #
-        #   Branch B (created=False, tid == latest prior thinking):
-        #     Dedup collapsed onto the row that is already the latest live
-        #     thinking in this objective. This is a pure no-op run: the
-        #     live answer has not moved. Record `reused_thinking_id` for
-        #     the caller, write NO edges. A REUSES edge here would be a
-        #     self-loop (forbidden by store.reuse) or spurious provenance.
-        #
-        #   Branch C (created=False, tid != latest prior thinking):
-        #     Dedup collapsed onto an OLDER row. The latest live thinking
-        #     in this objective traced back to `tid` because new evidence
-        #     pointed that way. Write (latest_id)-[:REUSES]->(tid) with
-        #     the convention "latest -> reused_ancestor". Do NOT set
-        #     supersedes_id: no new live thinking was produced this run.
+        # Branch A — a brand-new Thinking row was created. Its
+        # supersedes_id field and SUPERSEDES edge were written inside
+        # insert_thinking based on `effective_supersedes`.
+        # Branch B/C — dedup collapsed onto an existing row. The
+        # existing row already has its own stored quality_score; do
+        # not overwrite.
         if created:
-            # Branch A
             result.new_thinking_id = tid
-            result.supersedes_id = supersedes_candidate
+            result.supersedes_id = effective_supersedes
+            result.branched = (
+                supersedes_candidate is not None and effective_supersedes is None
+            )
+            if result.branched:
+                print(
+                    f"[orchestrator] quality regression on objective "
+                    f"{objective_id}: new thinking {tid} overall "
+                    f"{quality.overall:.3f} < prior "
+                    f"{prior_overall:.3f} − {QUALITY_REGRESSION_EPSILON}; "
+                    f"kept as sibling branch (no SUPERSEDES edge)",
+                    file=sys.stderr,
+                )
             store.update_objective(self.backend, objective_id, status="researched")
         else:
             result.reused_thinking_id = int(tid)
@@ -182,7 +221,9 @@ class Orchestrator:
             if tip is not None:
                 latest_id = int(tip["id"])
                 if int(tid) != latest_id:
-                    # Branch C: collapse onto older row.
+                    # Branch C: collapsed onto an older row; the latest
+                    # live tip reused it via a REUSES edge (pre-iter-4
+                    # semantics).
                     store.reuse(self.backend, latest_id, int(tid))
                     print(
                         f"[orchestrator] reused thinking {tid} is older than latest "
@@ -190,4 +231,15 @@ class Orchestrator:
                         file=sys.stderr,
                     )
                 # Branch B: tid == latest_id -> no edge, no supersedes.
+            # When we reuse, the "live answer" is whatever the dedup
+            # collapsed onto. Report its stored quality so the caller
+            # still sees a score (not None) for every research run.
+            reused_row = store.get_thinking(self.backend, int(tid))
+            if reused_row is not None:
+                stored = reused_row.get("quality_score")
+                if stored:
+                    result.quality_score = dict(stored)
+                ab = reused_row.get("actor_backend")
+                if ab:
+                    result.actor_backend = str(ab)
         return result

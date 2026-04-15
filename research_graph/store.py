@@ -41,7 +41,12 @@ _OBJECTIVE_MUTABLE = {"question", "status"}
 # through dedup.upsert_source / upsert_thinking, which atomically
 # re-index. Only metadata fields here.
 _SOURCE_MUTABLE = {"url", "title", "search_query"}
-_THINKING_MUTABLE = {"author"}
+# iter-4 continual-research: Thinkings now carry a quality score and
+# the name of the actor backend that produced them, so supersession
+# gating (orchestrator) and daily-cron evaluation have a first-class
+# signal to read/write. Content still immutable — content edits must
+# go through dedup.upsert_thinking.
+_THINKING_MUTABLE = {"author", "quality_score", "quality_overall", "actor_backend"}
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +338,15 @@ def insert_thinking(
     supports_source_ids: list[int],
     author: str,
     supersedes_id: int | None = None,
+    *,
+    quality_score: dict | None = None,
+    quality_overall: float | None = None,
+    actor_backend: str | None = None,
 ) -> int:
+    # iter-4 continual-research: the orchestrator attaches a
+    # QualityScore and the name of the actor backend that produced the
+    # thinking AT INSERT TIME so provenance is atomic with the row.
+    # All three are optional to keep every pre-iter-4 caller working.
     tid = backend.create_node(
         LABEL_THINKING,
         {
@@ -348,6 +361,11 @@ def insert_thinking(
             "author": author,
             "created_at": _now(),
             "supersedes_id": supersedes_id,
+            "quality_score": dict(quality_score) if quality_score else None,
+            "quality_overall": (
+                float(quality_overall) if quality_overall is not None else None
+            ),
+            "actor_backend": actor_backend,
         },
     )
     backend.create_edge(int(objective_id), REL_HAS_THINKING, tid)
@@ -379,26 +397,32 @@ def list_thinkings(backend: GraphBackend, objective_id: int) -> list[dict]:
 def latest_live_thinking(
     backend: GraphBackend, objective_id: int
 ) -> dict | None:
-    """Return the live (non-superseded) tip of the supersession chain.
-
-    The previous orchestrator computed "the prior latest thinking" as
-    `list_thinkings(...)[-1]`, which is fragile: it assumes
-    `out_neighbors` returns rows in id order AND that id order is a
-    proxy for time. Both hold today on the in-memory backend (which
-    sorts by id) and the Neo4j backend (which uses a monotonic id
-    counter), but a future backend with reclaimed/UUID ids would
-    silently misidentify "latest."
-
-    Definition of "live" (Cypher equivalent):
-        MATCH (o:Objective {id: $oid})-[:HAS_THINKING]->(t:Thinking)
-        WHERE NOT EXISTS { (other:Thinking)-[:SUPERSEDES]->(t) }
-        RETURN t ORDER BY t.created_at DESC, t.id DESC LIMIT 1
+    """Return the best-quality live (non-superseded) thinking.
 
     A thinking is "live" when no other thinking has SUPERSEDED it.
-    Among multiple live tips (which can occur when an old run reused
-    an even older row without superseding), we break ties by
-    `created_at` descending then `id` descending so the answer is
-    deterministic.
+
+    iter-4 continual-research semantics: when there are multiple live
+    thinkings (which is now the normal case whenever quality-gated
+    supersession has kept a sibling branch — see `Orchestrator.research`
+    and the `branched` flag on `ResearchResult`), we pick the one with
+    the highest `quality_overall`. Rows inserted before iter-4 (or rows
+    where the actor backend didn't populate a score) have
+    `quality_overall == None` and are treated as the lowest priority so
+    they never unseat a scored row. Ties on quality fall back to
+    `created_at` DESC then `id` DESC, preserving pre-iter-4 behaviour
+    for any objective whose thinkings all pre-date the scoring layer.
+
+    Cypher equivalent (post iter-4):
+        MATCH (o:Objective {id: $oid})-[:HAS_THINKING]->(t:Thinking)
+        WHERE NOT EXISTS { (other:Thinking)-[:SUPERSEDES]->(t) }
+        RETURN t
+        ORDER BY coalesce(t.quality_overall, -1) DESC,
+                 t.created_at DESC, t.id DESC
+        LIMIT 1
+
+    This is what makes "더 많은 추론 파워 → 더 좋은 답" structurally
+    hold: a regression branch cannot unseat the prior tip because its
+    lower quality_overall keeps it below the old tip in the sort order.
     """
     thinkings = list_thinkings(backend, objective_id)
     if not thinkings:
@@ -413,7 +437,15 @@ def latest_live_thinking(
         # Cycle / corruption fallback: return the highest-id thinking
         # so callers always get *something* even if SUPERSEDES is broken.
         return thinkings[-1]
-    live.sort(key=lambda r: (r.get("created_at") or "", int(r["id"])), reverse=True)
+
+    def _rank_key(row: dict) -> tuple:
+        # Primary: quality_overall DESC (None → -1.0 so unscored rows
+        # always sink below any scored row).
+        qo = row.get("quality_overall")
+        q = float(qo) if qo is not None else -1.0
+        return (q, row.get("created_at") or "", int(row["id"]))
+
+    live.sort(key=_rank_key, reverse=True)
     return live[0]
 
 

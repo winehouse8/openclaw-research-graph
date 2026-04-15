@@ -160,6 +160,11 @@ class CLITest(unittest.TestCase):
             "reused_thinking_id",
             "supersedes_id",
             "rejected_reasons",
+            # iter-4 continual-research fields (see
+            # test_spec_compliance::ResearchResultContractTest).
+            "quality_score",
+            "actor_backend",
+            "branched",
         }
         self.assertEqual(set(cli_dict.keys()), expected_keys)
         self.assertEqual(set(api_dict.keys()), expected_keys)

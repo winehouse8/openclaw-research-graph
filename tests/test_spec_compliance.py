@@ -256,6 +256,12 @@ class ResearchResultContractTest(unittest.TestCase):
             "new_source_ids", "reused_source_ids",
             "new_thinking_id", "reused_thinking_id",
             "supersedes_id", "rejected_reasons",
+            # iter-4 continual-research fields: every run now carries
+            # a quality score + actor backend provenance + a sibling-
+            # branch flag so daily-cron callers can tell "answer
+            # improved" from "answer regressed" from "live tip
+            # unchanged" from "new branch kept as sibling".
+            "quality_score", "actor_backend", "branched",
         }
         self.assertEqual(set(d.keys()), expected)
 

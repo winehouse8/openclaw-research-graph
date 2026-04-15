@@ -179,7 +179,7 @@ class ReuseSelfLoopRegressionTest(unittest.TestCase):
         real_upsert = _dedup.upsert_thinking
 
         def fake_upsert(backend_, objective_id_, content, supports, author,
-                        supersedes_id=None, threshold=0.85):
+                        supersedes_id=None, threshold=0.85, **_):
             return (int(t1_id), False)
 
         _orch_mod.dedup.upsert_thinking = fake_upsert  # type: ignore[attr-defined]
@@ -234,7 +234,7 @@ class ReuseSelfLoopRegressionTest(unittest.TestCase):
 
         real_upsert = _dedup.upsert_thinking
         _orch_mod.dedup.upsert_thinking = (  # type: ignore[attr-defined]
-            lambda b, o, c, s, author, supersedes_id=None, threshold=0.85: (int(t1), False)
+            lambda b, o, c, s, author, supersedes_id=None, threshold=0.85, **_: (int(t1), False)
         )
         try:
             r_reuse = Orchestrator(
