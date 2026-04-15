@@ -1,0 +1,38 @@
+{
+  "local llm mac mini": [
+    {
+      "url": "https://example.org/llm-bench-2026",
+      "title": "Local LLM benchmarks on 16GB Mac mini",
+      "content": "On a 16GB Apple Silicon Mac mini the Llama 3.1 8B Q4 model runs at roughly 18 tokens per second using llama.cpp with Metal acceleration. Mistral 7B Q4 reaches about 22 tokens per second but uses more context memory."
+    },
+    {
+      "url": "https://example.org/ollama-mac",
+      "title": "Ollama on Apple Silicon",
+      "content": "Ollama wraps llama.cpp and supports Metal. On 16GB systems Phi-3 mini and Llama 3.1 8B fit comfortably while leaving headroom for the operating system."
+    },
+    {
+      "url": "https://example.org/llm-update-2026",
+      "title": "Updated 2026 ranking of local models",
+      "content": "Newer Qwen 2.5 7B Instruct quantized to Q4_K_M outperforms Llama 3.1 8B on instruction following while running at similar speed on a 16GB Mac mini. This supersedes the 2025 ranking."
+    }
+  ],
+  "agentic memory": [
+    {
+      "url": "https://example.org/memgpt",
+      "title": "MemGPT overview",
+      "content": "MemGPT introduces hierarchical memory for LLM agents with a working set and an archival store managed by tool calls."
+    },
+    {
+      "url": "https://example.org/letta",
+      "title": "Letta agentic memory",
+      "content": "Letta is the productized successor to MemGPT and exposes a REST API plus persistent agent state across sessions."
+    }
+  ],
+  "default": [
+    {
+      "url": "https://example.org/default-1",
+      "title": "Generic research result",
+      "content": "This is a placeholder result returned when no specific fixture matches the query."
+    }
+  ]
+}

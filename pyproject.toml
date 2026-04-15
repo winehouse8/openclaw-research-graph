@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openclaw-research-graph"
+version = "0.1.0"
+description = "Continual research memory and retrieval for OpenClaw (stdlib only)."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["research_graph*"]
+
+[tool.setuptools.package-data]
+research_graph = ["_fixtures/*.json"]
