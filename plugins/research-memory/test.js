@@ -177,3 +177,101 @@ test("graph_walk rejects unsupported modes with a clear error", async () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test("plugin error paths surface structured json, not flattened strings", async () => {
+  const { tmp, settings } = makeTempSettings();
+  try {
+    // First create a real objective so the failure is in source validation,
+    // not in objective lookup.
+    const rt = await handlers.researchTopic({
+      settings,
+      topic: "structured-errors",
+      question: "Do helper errors round-trip as structured json?",
+    });
+    let caught;
+    try {
+      await handlers.memoryIngest({
+        settings,
+        objectiveId: rt.objective_id,
+        // Malformed: missing required `content` field, url is null.
+        sources: [{ url: null }],
+      });
+    } catch (err) {
+      caught = err;
+    }
+    assert.ok(caught, "memoryIngest should reject on malformed source");
+    assert.ok(caught instanceof Error, "rejection must be an Error instance");
+    assert.ok(
+      caught.cause && typeof caught.cause === "object",
+      "Error must carry structured payload as .cause",
+    );
+    assert.equal(typeof caught.cause.error, "string", "cause.error must be a string");
+    assert.equal(typeof caught.cause.type, "string", "cause.type must be a string");
+    assert.ok(
+      caught.message.includes(caught.cause.type),
+      `error message should include the type for readability, got: ${caught.message}`,
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("/research ::-split is exactly one occurrence", async () => {
+  const { tmp, settings } = makeTempSettings();
+  try {
+    // Topic containing '::' must be rejected up front.
+    await assert.rejects(
+      () => handlers.researchTopic({
+        settings,
+        topic: "ai::models",
+        question: "what is best?",
+      }),
+      /must not contain '::'/,
+    );
+
+    // Question containing '::' must be accepted verbatim. Use a real
+    // research_topic round-trip and assert the question survived intact.
+    const result = await handlers.researchTopic({
+      settings,
+      topic: "models",
+      question: "what::is::best",
+    });
+    assert.equal(
+      result.question,
+      "what::is::best",
+      "question must survive '::' verbatim",
+    );
+    assert.equal(result.topic, "models");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("preflight fails fast with actionable error when packageDir is bogus", async () => {
+  const bogus = "/tmp/nonexistent-research-graph-" + Date.now();
+  const settings = resolveSettings(
+    {},
+    {
+      dbPath: path.join(os.tmpdir(), "preflight-bogus.json"),
+      python: process.env.PYTHON || "python3",
+      packageDir: bogus,
+    },
+  );
+  let caught;
+  try {
+    await handlers.memoryStatus({ settings });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught, "memoryStatus must reject when packageDir is bogus");
+  assert.match(
+    caught.message,
+    /research_graph package not importable/,
+    `expected actionable preflight error, got: ${caught.message}`,
+  );
+  assert.ok(
+    caught.message.includes("packageDir") ||
+      caught.message.includes("RESEARCH_GRAPH_PACKAGE_DIR"),
+    `expected message to mention packageDir or RESEARCH_GRAPH_PACKAGE_DIR, got: ${caught.message}`,
+  );
+});

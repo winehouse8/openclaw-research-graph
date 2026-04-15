@@ -82,15 +82,27 @@ function runPython(python, args, { packageDir, timeoutMs = 120_000 } = {}) {
     });
     child.on("close", (code) => {
       clearTimeout(to);
-      if (code === 0) {
-        resolve({ stdout, stderr });
-      } else {
-        reject(new Error(
-          `python bridge exited ${code}: ${stderr.trim() || stdout.trim()}`,
-        ));
-      }
+      // Always resolve with the captured streams + exit code. The caller
+      // (each handler) is responsible for parsing stdout JSON and surfacing
+      // structured errors via throwStructured. This lets us treat both
+      // exit-0 in-band errors (plugin_helper) and non-zero CLI errors
+      // (`python -m research_graph`) uniformly: parse stdout first, fall
+      // back to stderr only if stdout has no parseable JSON.
+      resolve({ stdout, stderr, code });
     });
   });
+}
+
+function tryParseJson(stdout) {
+  const trimmed = stdout.trim();
+  if (!trimmed) return null;
+  const lines = trimmed.split(/\n/).filter((l) => l.trim().length > 0);
+  const last = lines[lines.length - 1];
+  try {
+    return JSON.parse(last);
+  } catch {
+    return null;
+  }
 }
 
 function parseJson(stdout) {
@@ -104,6 +116,99 @@ function parseJson(stdout) {
     return JSON.parse(last);
   } catch (err) {
     throw new Error(`failed to parse JSON from python bridge: ${err.message}\nraw: ${trimmed}`);
+  }
+}
+
+/**
+ * Throw a structured Error built from a parsed JSON payload that signals
+ * failure (either `ok === false` or a top-level `error` key). The original
+ * parsed object is attached as `.cause` so callers can branch on
+ * `err.cause.type` programmatically. The thrown message includes `type`
+ * for human readability.
+ */
+function throwStructured(parsed, fallback) {
+  const type = parsed && typeof parsed.type === "string" ? parsed.type : "Error";
+  const message = parsed && typeof parsed.error === "string"
+    ? parsed.error
+    : (fallback || "python bridge reported failure");
+  const err = new Error(`python bridge error [${type}]: ${message}`);
+  err.cause = parsed;
+  throw err;
+}
+
+/**
+ * Run a python subprocess and parse its stdout JSON, throwing a structured
+ * error if the helper signalled failure (in-band on exit 0) or if the CLI
+ * exited non-zero. Returns the parsed JSON payload on success.
+ */
+async function runPythonJson(python, args, opts = {}) {
+  const { stdout, stderr, code } = await runPython(python, args, opts);
+  const parsed = tryParseJson(stdout);
+  if (code === 0) {
+    if (parsed && parsed.ok === false) {
+      // In-band failure from plugin_helper.py (always exits 0, signals via ok)
+      throwStructured(parsed, stderr.trim());
+    }
+    if (parsed === null) {
+      // Empty stdout on success -> let parseJson surface a clean error
+      return parseJson(stdout);
+    }
+    return parsed;
+  }
+  // Non-zero exit: prefer parseable structured JSON, else fall back to stderr.
+  if (parsed && (parsed.ok === false || parsed.error)) {
+    throwStructured(parsed, stderr.trim());
+  }
+  throw new Error(
+    `python bridge exited ${code}: ${stderr.trim() || stdout.trim()}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Preflight: verify the research_graph python package is importable from the
+// configured packageDir using the same spawn/cwd/env the real tool calls use.
+// Cached on the settings object so it runs at most once per process per
+// settings instance.
+
+async function preflightCheck(settings) {
+  if (settings.__preflightOk) return;
+  if (settings.__preflightPromise) {
+    await settings.__preflightPromise;
+    return;
+  }
+  settings.__preflightPromise = (async () => {
+    let stdout = "", stderr = "", code = 0;
+    try {
+      const r = await runPython(
+        settings.python,
+        ["-c", "import research_graph, sys; print(research_graph.__file__)"],
+        { packageDir: settings.packageDir, timeoutMs: 30_000 },
+      );
+      stdout = r.stdout; stderr = r.stderr; code = r.code;
+    } catch (spawnErr) {
+      // spawn-level failures (ENOENT cwd, missing python3 binary, etc.)
+      throw new Error(
+        `research_graph package not importable from ${settings.packageDir}. ` +
+        `Set pluginConfig.packageDir or RESEARCH_GRAPH_PACKAGE_DIR. ` +
+        `Underlying error: ${spawnErr.message || String(spawnErr)}`,
+      );
+    }
+    if (code !== 0) {
+      throw new Error(
+        `research_graph package not importable from ${settings.packageDir}. ` +
+        `Set pluginConfig.packageDir or RESEARCH_GRAPH_PACKAGE_DIR. ` +
+        `Underlying error: ${stderr.trim() || stdout.trim() || "(no output)"}`,
+      );
+    }
+    settings.__preflightOk = true;
+  })();
+  try {
+    await settings.__preflightPromise;
+  } finally {
+    if (!settings.__preflightOk) {
+      // Allow retries after a failure (e.g. operator fixes packageDir).
+      settings.__preflightPromise = null;
+    }
   }
 }
 
@@ -121,28 +226,38 @@ function helperArgs(settings, helperCliArgs) {
 
 export const handlers = {
   async memoryStatus({ settings }) {
-    const { stdout } = await runPython(
+    // memory_status is the canonical operator probe — explicitly call
+    // preflight here so /memory-status surfaces a clear "package not
+    // importable" error instead of bubbling a raw ImportError.
+    await preflightCheck(settings);
+    return runPythonJson(
       settings.python,
       helperArgs(settings, ["status"]),
       { packageDir: settings.packageDir },
     );
-    return parseJson(stdout);
   },
 
   async researchTopic({ settings, topic, question, forceRefresh = false }) {
     if (!topic || !question) {
       throw new Error("research_topic requires both `topic` and `question`");
     }
+    if (typeof topic === "string" && topic.includes("::")) {
+      throw new Error(
+        `research_topic: topic must not contain '::' (got ${JSON.stringify(topic)}). ` +
+        "Topics are separated from questions by '::' in /research, so '::' is reserved. " +
+        "Rename the topic; questions are allowed to contain '::' verbatim.",
+      );
+    }
+    await preflightCheck(settings);
     const args = helperArgs(settings, [
       "research-topic",
       "--topic", topic,
       "--question", question,
       ...(forceRefresh ? ["--force-refresh"] : []),
     ]);
-    const { stdout } = await runPython(settings.python, args, {
+    return runPythonJson(settings.python, args, {
       packageDir: settings.packageDir,
     });
-    return parseJson(stdout);
   },
 
   async memorySearch({ settings, query, kind = "sources", topK = 5, objectiveId }) {
@@ -150,6 +265,7 @@ export const handlers = {
     if (kind !== "sources" && kind !== "thinkings") {
       throw new Error(`memory_search kind must be sources|thinkings, got ${kind}`);
     }
+    await preflightCheck(settings);
     const args = pythonMainArgs(settings, [
       "query",
       query,
@@ -158,21 +274,21 @@ export const handlers = {
       "--json",
       ...(objectiveId != null ? ["--objective", String(objectiveId)] : []),
     ]);
-    const { stdout } = await runPython(settings.python, args, {
+    const hits = await runPythonJson(settings.python, args, {
       packageDir: settings.packageDir,
     });
-    return { kind, query, topK, hits: parseJson(stdout) || [] };
+    return { kind, query, topK, hits: hits || [] };
   },
 
   async memoryIngest({ settings, objectiveId, sources }) {
     if (objectiveId == null) throw new Error("memory_ingest requires `objective_id`");
     if (!Array.isArray(sources)) throw new Error("memory_ingest requires `sources` array");
+    await preflightCheck(settings);
     const payload = JSON.stringify({ objective_id: objectiveId, sources });
     const args = helperArgs(settings, ["ingest", "--payload", payload]);
-    const { stdout } = await runPython(settings.python, args, {
+    return runPythonJson(settings.python, args, {
       packageDir: settings.packageDir,
     });
-    return parseJson(stdout);
   },
 
   async graphWalk({ settings, mode, anchorId }) {
@@ -186,6 +302,7 @@ export const handlers = {
         `graph_walk mode must be one of ${[...allowed].join(", ")} (got ${mode}). See README for the supersession-chain deviation note.`,
       );
     }
+    await preflightCheck(settings);
     const base = ["walk", mode];
     const extras = [];
     if (mode === "4hop" || mode === "cocited") {
@@ -196,12 +313,47 @@ export const handlers = {
     }
     extras.push("--json");
     const args = pythonMainArgs(settings, [...base, ...extras]);
-    const { stdout } = await runPython(settings.python, args, {
+    const result = await runPythonJson(settings.python, args, {
       packageDir: settings.packageDir,
     });
-    return { mode, anchorId: anchorId ?? null, result: parseJson(stdout) };
+    return { mode, anchorId: anchorId ?? null, result };
   },
 };
+
+// ---------------------------------------------------------------------------
+// Slash command parsers exported for direct testing.
+
+/**
+ * Parse the raw argv for `/research <topic>::<question>` and dispatch to
+ * researchTopic. The first `::` is the separator (use indexOf, not split):
+ * topics MUST NOT contain `::`, but questions MAY contain `::` verbatim.
+ */
+export async function parseAndRunResearchCommand(settings, argv) {
+  const raw = (Array.isArray(argv) ? argv.join(" ") : String(argv || "")).trim();
+  const sepIdx = raw.indexOf("::");
+  if (sepIdx < 0) {
+    throw new Error(
+      "usage: /research <topic>::<question> (missing '::' separator)",
+    );
+  }
+  const topic = raw.slice(0, sepIdx).trim();
+  const question = raw.slice(sepIdx + 2).trim();
+  if (!topic) {
+    throw new Error("usage: /research <topic>::<question> (empty topic)");
+  }
+  if (!question) {
+    throw new Error("usage: /research <topic>::<question> (empty question)");
+  }
+  if (topic.includes("::")) {
+    // Defensive: by construction this cannot happen because we sliced on the
+    // first occurrence, but assert it so a future refactor cannot regress.
+    throw new Error(
+      `/research topic must not contain '::' (got ${JSON.stringify(topic)}). ` +
+      "Rename the topic or escape it; questions may contain '::' but topics may not.",
+    );
+  }
+  return handlers.researchTopic({ settings, topic, question });
+}
 
 // ---------------------------------------------------------------------------
 // Helpers for formatting tool results into the SDK's expected content shape.
@@ -376,16 +528,10 @@ async function buildEntry() {
       api.registerCommand?.({
         name: "research",
         description:
-          "Start or resume a research objective. Usage: /research <topic>::<question>",
+          "Start or resume a research objective. Usage: /research <topic>::<question>. The topic must NOT contain '::' (the first '::' is the separator); the question MAY contain '::' verbatim.",
         async execute({ argv }) {
           return runCommand(argv, async (settings, a) => {
-            const raw = (Array.isArray(a) ? a.join(" ") : String(a || "")).trim();
-            const [topic, ...rest] = raw.split("::");
-            const question = rest.join("::").trim();
-            if (!topic || !question) {
-              throw new Error("usage: /research <topic>::<question>");
-            }
-            return handlers.researchTopic({ settings, topic: topic.trim(), question });
+            return parseAndRunResearchCommand(settings, a);
           });
         },
       });

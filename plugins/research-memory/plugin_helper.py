@@ -7,8 +7,11 @@ output (status aggregation, direct source ingestion, topic+objective resolve
 + research in one call) while reusing the same `research_graph` Python
 package so there is exactly one canonical memory store.
 
-All subcommands print one JSON document to stdout and exit 0 on success. On
-error they print a JSON document with an "error" key and exit non-zero.
+All subcommands print one JSON document to stdout and ALWAYS exit 0. Failure
+is signalled in-band via {"ok": false, "error", "type", "traceback"} so the
+JS caller can parse a structured error object instead of getting a flattened
+stderr string. Success payloads omit the "ok" key (callers treat absent ok
+as success for backwards compat).
 
 Intentionally stdlib-only so it runs wherever the `research_graph` package
 runs (no extra deps).
@@ -110,9 +113,21 @@ def cmd_ingest(args: argparse.Namespace) -> dict:
     skipped: list[dict] = []
     try:
         for s in sources:
+            if not isinstance(s, dict):
+                raise TypeError(
+                    f"each source must be an object, got {type(s).__name__}"
+                )
+            if "content" not in s or s.get("content") is None:
+                raise ValueError(
+                    "source is missing required string field 'content'"
+                )
             url = s.get("url")
             title = s.get("title")
             content = s.get("content") or ""
+            if not isinstance(content, str):
+                raise TypeError(
+                    f"source 'content' must be a string, got {type(content).__name__}"
+                )
             if not content:
                 skipped.append({"url": url, "reason": "empty-content"})
                 continue
@@ -221,11 +236,15 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     except Exception as exc:  # pragma: no cover - surfaced to caller
         print(json.dumps({
+            "ok": False,
             "error": str(exc),
             "type": type(exc).__name__,
             "traceback": traceback.format_exc(),
         }))
-        return 2
+        # Always exit 0 so the JS caller does not collapse our structured
+        # error JSON into a flat stderr string. Failure is signalled by
+        # ok=false in the parsed object.
+        return 0
 
     print(json.dumps(out, default=str, sort_keys=True))
     return 0
