@@ -77,10 +77,14 @@ class OrchestratorTest(unittest.TestCase):
         self.assertEqual(again.mode, "memory_augmented")
         self.assertIsNone(again.new_thinking_id)
         self.assertEqual(again.reused_thinking_id, cold_thinking_id)
+        self.assertIsNone(again.supersedes_id)
         self.assertIsNotNone(store.get_thinking(self.backend, cold_thinking_id))
-        # Reuse edge was persisted.
+        # Branch B: dedup collapsed onto the latest-and-only thinking, so
+        # NO REUSES edge is written (self-loops forbidden; there is no
+        # older row to point at). ResearchResult still carries
+        # reused_thinking_id so the caller can observe the no-op run.
         reuses = store.list_reuses(self.backend, self.oid)
-        self.assertGreaterEqual(len(reuses), 1)
+        self.assertEqual(len(reuses), 0)
 
 
 class SearchBackendTest(unittest.TestCase):

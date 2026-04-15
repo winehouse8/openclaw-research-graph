@@ -14,10 +14,71 @@ instantiation against the same database is safe.
 This module is only imported when the user opts in via
 ``OPENCLAW_GRAPH_BACKEND=neo4j``; nothing above it in the call stack
 takes a hard dependency on the ``neo4j`` package.
+
+Cypher label / relationship-type / property-key values cannot be passed
+as query parameters; they must be spliced into the query string. That
+splice is an injection vector unless every untrusted value is matched
+against an allowlist first. The module-level helpers below are the
+single source of truth for those allowlists and are applied on every
+read, traversal, and write path that interpolates such values.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Allowlists for values that must be spliced (not parameterised) into Cypher.
+# These are module-level so every path in the backend uses the same source
+# of truth and tests can import them directly without instantiating a driver.
+# ---------------------------------------------------------------------------
+_VALID_LABELS: set[str] = {"Topic", "Objective", "Source", "Thinking"}
+_VALID_RELS: set[str] = {
+    "HAS_OBJECTIVE",
+    "HAS_SOURCE",
+    "HAS_THINKING",
+    "CITES",
+    "SUPERSEDES",
+    "REUSES",
+}
+_VALID_PROP_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _check_label(x: str) -> None:
+    if x not in _VALID_LABELS:
+        raise ValueError(f"unknown label: {x!r}")
+
+
+def _check_rel(x: str) -> None:
+    if x not in _VALID_RELS:
+        raise ValueError(f"unknown relationship: {x!r}")
+
+
+def _check_prop_key(k: str) -> None:
+    if not isinstance(k, str) or not _VALID_PROP_KEY.match(k):
+        raise ValueError(f"invalid property key: {k!r}")
+
+
+def _where_clause(
+    where: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """Build a ``WHERE n.k = $w_k AND ...`` clause.
+
+    Property keys are splice-validated against ``_VALID_PROP_KEY`` so a
+    malicious caller cannot break out of the clause via a crafted key.
+    Values themselves ride the parameter map and are safe.
+    """
+    if not where:
+        return "", {}
+    parts: list[str] = []
+    params: dict[str, Any] = {}
+    for k, v in where.items():
+        _check_prop_key(k)
+        key = f"w_{k}"
+        parts.append(f"n.{k} = ${key}")
+        params[key] = v
+    return "WHERE " + " AND ".join(parts), params
 
 
 class Neo4jBackend:
@@ -80,8 +141,9 @@ class Neo4jBackend:
     # Node operations
     # ------------------------------------------------------------------
     def create_node(self, label: str, properties: dict[str, Any]) -> int:
-        if label not in {"Topic", "Objective", "Source", "Thinking"}:
-            raise ValueError(f"unsupported node label: {label}")
+        _check_label(label)
+        for k in properties.keys():
+            _check_prop_key(k)
         nid = self._next_id()
         props = dict(properties)
         props["id"] = nid
@@ -104,7 +166,8 @@ class Neo4jBackend:
     def find_node(
         self, label: str, where: dict[str, Any]
     ) -> dict[str, Any] | None:
-        clauses, params = self._where_clause(where)
+        _check_label(label)
+        clauses, params = _where_clause(where)
         cypher = f"MATCH (n:{label}) {clauses} RETURN n, labels(n) AS labels LIMIT 1"
         with self._session() as s:
             rec = s.run(cypher, **params).single()
@@ -113,7 +176,8 @@ class Neo4jBackend:
     def list_nodes(
         self, label: str, where: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
-        clauses, params = self._where_clause(where or {})
+        _check_label(label)
+        clauses, params = _where_clause(where or {})
         cypher = (
             f"MATCH (n:{label}) {clauses} "
             "RETURN n, labels(n) AS labels ORDER BY n.id"
@@ -123,6 +187,8 @@ class Neo4jBackend:
         return [self._flatten_record(r) for r in rows if r is not None]
 
     def update_node(self, node_id: int, properties: dict[str, Any]) -> None:
+        for k in properties.keys():
+            _check_prop_key(k)
         cypher = "MATCH (n) WHERE n.id = $id SET n += $props"
         with self._session() as s:
             s.run(cypher, id=int(node_id), props=dict(properties))
@@ -150,15 +216,7 @@ class Neo4jBackend:
         dst_id: int,
         properties: dict[str, Any] | None = None,
     ) -> None:
-        if rel not in {
-            "HAS_OBJECTIVE",
-            "HAS_SOURCE",
-            "HAS_THINKING",
-            "CITES",
-            "SUPERSEDES",
-            "REUSES",
-        }:
-            raise ValueError(f"unsupported relationship type: {rel}")
+        _check_rel(rel)
         cypher = (
             "MATCH (a), (b) WHERE a.id = $src AND b.id = $dst "
             f"MERGE (a)-[r:{rel}]->(b) SET r += $props"
@@ -172,6 +230,7 @@ class Neo4jBackend:
             )
 
     def has_edge(self, src_id: int, rel: str, dst_id: int) -> bool:
+        _check_rel(rel)
         cypher = (
             "MATCH (a)-[r]->(b) WHERE a.id = $src AND b.id = $dst AND type(r) = $rel "
             "RETURN count(r) AS c"
@@ -188,6 +247,10 @@ class Neo4jBackend:
         rel: str | None = None,
         label: str | None = None,
     ) -> list[dict[str, Any]]:
+        if rel is not None:
+            _check_rel(rel)
+        if label is not None:
+            _check_label(label)
         rel_part = f":{rel}" if rel else ""
         label_part = f":{label}" if label else ""
         cypher = (
@@ -204,6 +267,10 @@ class Neo4jBackend:
         rel: str | None = None,
         label: str | None = None,
     ) -> list[dict[str, Any]]:
+        if rel is not None:
+            _check_rel(rel)
+        if label is not None:
+            _check_label(label)
         rel_part = f":{rel}" if rel else ""
         label_part = f":{label}" if label else ""
         cypher = (
@@ -223,6 +290,9 @@ class Neo4jBackend:
         dst_id: int,
         rels: list[str] | None = None,
     ) -> list[int] | None:
+        if rels:
+            for r in rels:
+                _check_rel(r)
         rel_filter = "|".join(rels) if rels else ""
         rel_part = f":{rel_filter}" if rel_filter else ""
         cypher = (
@@ -242,6 +312,9 @@ class Neo4jBackend:
         hops: int,
         rels: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        if rels:
+            for r in rels:
+                _check_rel(r)
         rel_filter = "|".join(rels) if rels else ""
         rel_part = f":{rel_filter}" if rel_filter else ""
         cypher = (
@@ -282,7 +355,7 @@ class Neo4jBackend:
         node = rec["n"]
         labels = list(rec["labels"])
         label = next(
-            (l for l in labels if l in {"Topic", "Objective", "Source", "Thinking"}),
+            (l for l in labels if l in _VALID_LABELS),
             labels[0] if labels else "",
         )
         out: dict[str, Any] = dict(node)
@@ -294,12 +367,5 @@ class Neo4jBackend:
     def _where_clause(
         self, where: dict[str, Any]
     ) -> tuple[str, dict[str, Any]]:
-        if not where:
-            return "", {}
-        parts: list[str] = []
-        params: dict[str, Any] = {}
-        for k, v in where.items():
-            key = f"w_{k}"
-            parts.append(f"n.{k} = ${key}")
-            params[key] = v
-        return "WHERE " + " AND ".join(parts), params
+        # Back-compat shim: delegate to the module-level helper.
+        return _where_clause(where)

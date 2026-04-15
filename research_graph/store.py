@@ -295,6 +295,12 @@ def supersede(backend: GraphBackend, new_id: int, old_id: int) -> None:
 
 
 def reuse(backend: GraphBackend, reuser_id: int, reused_id: int) -> None:
+    # REUSES self-loops are forbidden: the edge represents "the current
+    # latest thinking in an objective pointed back at an OLDER thinking
+    # because new evidence dedup-collapsed onto it." A self-loop would
+    # pollute list_reuses / thinking_neighborhood with a fact that has
+    # no provenance value.
+    assert int(reuser_id) != int(reused_id), "REUSES self-loop forbidden"
     backend.create_edge(int(reuser_id), REL_REUSES, int(reused_id))
 
 

@@ -98,27 +98,161 @@ class MultiDayReuseEdgeTest(unittest.TestCase):
             Orchestrator(backend, search=speed_search).research(oid_speed, force_refresh=force)
             Orchestrator(backend, search=mem_search).research(oid_mem, force_refresh=force)
 
-        # At least one REUSES edge was persisted on each objective where a
-        # dedup collapse happened (days 2 and 4 for speed, day 3/5 for mem).
+        # Any REUSES edges that exist must satisfy the branch-C invariant:
+        # reuser != reused (no self-loops) and both endpoints live in the
+        # same objective. Self-loops are forbidden by store.reuse() but we
+        # assert the observable invariant here as well.
         speed_reuses = store.list_reuses(backend, oid_speed)
         mem_reuses = store.list_reuses(backend, oid_mem)
-        self.assertGreaterEqual(
-            len(speed_reuses), 1,
-            f"expected >=1 REUSES edge on speed, got {len(speed_reuses)}",
-        )
-        self.assertGreaterEqual(
-            len(mem_reuses), 1,
-            f"expected >=1 REUSES edge on mem, got {len(mem_reuses)}",
-        )
-        # Each reuse pair points at valid Thinking nodes in the same objective.
+        for pair in speed_reuses + mem_reuses:
+            self.assertNotEqual(
+                int(pair["reuser"]["id"]), int(pair["reused"]["id"]),
+                "REUSES self-loop leaked into the graph",
+            )
         for pair in speed_reuses:
             self.assertEqual(pair["reuser"]["objective_id"], oid_speed)
             self.assertEqual(pair["reused"]["objective_id"], oid_speed)
+        for pair in mem_reuses:
+            self.assertEqual(pair["reuser"]["objective_id"], oid_mem)
+            self.assertEqual(pair["reused"]["objective_id"], oid_mem)
 
 
 # ---------------------------------------------------------------------------
 # Scenario 2: hand-crafted 4-hop walk
 # ---------------------------------------------------------------------------
+
+
+class ReuseSelfLoopRegressionTest(unittest.TestCase):
+    """HIGH 2 + HIGH 3 regression coverage for the three orchestrator
+    tail branches (created / no-op-collapse / older-row-collapse)."""
+
+    def test_reuses_no_self_loop_on_noop_run(self) -> None:
+        # Cold start followed by an immediate re-run on the SAME fixture.
+        # Branch A then Branch B: the second run collapses dedup onto the
+        # latest-and-only thinking, so NO reuse edge should be written.
+        backend = InMemoryGraphBackend()
+        tid = store.create_topic(backend, "t")
+        oid = store.create_objective(backend, tid, "q")
+
+        hits = [
+            SearchHit("https://ex/a", "A", "alpha bravo charlie delta echo foxtrot"),
+            SearchHit("https://ex/b", "B", "golf hotel india juliet kilo lima"),
+        ]
+        search = ScriptedSearch([hits, hits])
+
+        r1 = Orchestrator(backend, search=search).research(oid)
+        self.assertEqual(r1.mode, "cold_start")
+        self.assertIsNotNone(r1.new_thinking_id)
+        t1_id = r1.new_thinking_id
+
+        r2 = Orchestrator(backend, search=search).research(oid, force_refresh=False)
+        self.assertEqual(r2.mode, "memory_augmented")
+        self.assertIsNone(r2.new_thinking_id)
+        self.assertEqual(r2.reused_thinking_id, t1_id)
+        self.assertIsNone(r2.supersedes_id)
+
+        self.assertEqual(
+            len(store.list_reuses(backend, oid)), 0,
+            "noop-collapse onto latest must not emit a REUSES edge",
+        )
+
+        # --- Now drive Branch C manually by injecting a dedup result that
+        # targets an OLDER thinking while a NEWER one is the latest. We
+        # monkey-patch dedup.upsert_thinking inside the orchestrator module
+        # (this is where the orchestrator imports it) so the real dedup
+        # helper is unaffected for every other test.
+        hits2 = [
+            SearchHit("https://ex/c", "C", "mike november oscar papa quebec romeo"),
+        ]
+        search2 = ScriptedSearch([hits2])
+        r3 = Orchestrator(backend, search=search2).research(oid, force_refresh=True)
+        # Branch A: brand new thinking that supersedes t1.
+        self.assertIsNotNone(r3.new_thinking_id)
+        self.assertEqual(r3.supersedes_id, t1_id)
+        t2_id = r3.new_thinking_id
+
+        # Now t2 is the latest. Force dedup to collapse onto t1 on the
+        # next run -> Branch C: (t2)-[:REUSES]->(t1).
+        from research_graph import dedup as _dedup
+        from research_graph import orchestrator as _orch_mod
+
+        real_upsert = _dedup.upsert_thinking
+
+        def fake_upsert(backend_, objective_id_, content, supports, author,
+                        supersedes_id=None, threshold=0.85):
+            return (int(t1_id), False)
+
+        _orch_mod.dedup.upsert_thinking = fake_upsert  # type: ignore[attr-defined]
+        try:
+            r4 = Orchestrator(backend, search=search2).research(oid, force_refresh=True)
+        finally:
+            _orch_mod.dedup.upsert_thinking = real_upsert  # type: ignore[attr-defined]
+
+        self.assertIsNone(r4.new_thinking_id)
+        self.assertEqual(r4.reused_thinking_id, t1_id)
+        self.assertIsNone(
+            r4.supersedes_id,
+            "Branch C must not set supersedes_id on a no-new-thinking run",
+        )
+
+        reuses = store.list_reuses(backend, oid)
+        self.assertEqual(len(reuses), 1)
+        pair = reuses[0]
+        self.assertEqual(int(pair["reuser"]["id"]), int(t2_id))
+        self.assertEqual(int(pair["reused"]["id"]), int(t1_id))
+
+    def test_supersedes_reuses_mutual_exclusion(self) -> None:
+        # Explicit HIGH 3 coverage: the three branches are mutually
+        # exclusive. Branch C in particular must set reused_thinking_id
+        # WITHOUT setting supersedes_id, and Branch A must set
+        # supersedes_id WITHOUT writing a REUSES edge.
+        backend = InMemoryGraphBackend()
+        tid = store.create_topic(backend, "t")
+        oid = store.create_objective(backend, tid, "q")
+
+        hits_a = [SearchHit("https://ex/1", "1", "alpha bravo charlie delta")]
+        hits_b = [SearchHit("https://ex/2", "2", "echo foxtrot golf hotel")]
+
+        r_cold = Orchestrator(backend, search=ScriptedSearch([hits_a])).research(oid)
+        t1 = r_cold.new_thinking_id
+        self.assertIsNotNone(t1)
+        self.assertIsNone(r_cold.supersedes_id)  # nothing to supersede on cold start
+
+        r_super = Orchestrator(
+            backend, search=ScriptedSearch([hits_b])
+        ).research(oid, force_refresh=True)
+        t2 = r_super.new_thinking_id
+        self.assertIsNotNone(t2)
+        # Branch A: supersedes set, no reuse edge written this run.
+        self.assertEqual(r_super.supersedes_id, t1)
+        self.assertIsNone(r_super.reused_thinking_id)
+        self.assertEqual(len(store.list_reuses(backend, oid)), 0)
+
+        # Now collide onto t1 to exercise Branch C.
+        from research_graph import dedup as _dedup
+        from research_graph import orchestrator as _orch_mod
+
+        real_upsert = _dedup.upsert_thinking
+        _orch_mod.dedup.upsert_thinking = (  # type: ignore[attr-defined]
+            lambda b, o, c, s, author, supersedes_id=None, threshold=0.85: (int(t1), False)
+        )
+        try:
+            r_reuse = Orchestrator(
+                backend, search=ScriptedSearch([hits_b])
+            ).research(oid, force_refresh=True)
+        finally:
+            _orch_mod.dedup.upsert_thinking = real_upsert  # type: ignore[attr-defined]
+
+        # Branch C assertions: reused_thinking_id set, supersedes_id NOT set,
+        # new_thinking_id NOT set, and exactly one edge (t2)-[:REUSES]->(t1).
+        self.assertEqual(r_reuse.reused_thinking_id, int(t1))
+        self.assertIsNone(r_reuse.new_thinking_id)
+        self.assertIsNone(r_reuse.supersedes_id)
+
+        reuses = store.list_reuses(backend, oid)
+        self.assertEqual(len(reuses), 1)
+        self.assertEqual(int(reuses[0]["reuser"]["id"]), int(t2))
+        self.assertEqual(int(reuses[0]["reused"]["id"]), int(t1))
 
 
 class FourHopWalkTest(unittest.TestCase):

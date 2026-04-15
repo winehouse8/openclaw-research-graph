@@ -80,9 +80,13 @@ class Orchestrator:
             return result
 
         prior = store.list_thinkings(self.backend, objective_id)
-        supersedes = None
+        # supersedes_candidate is the prior latest thinking we WOULD point
+        # a new thinking at if one gets created this run. It is only used
+        # in the created=True branch below; the created=False branches
+        # MUST ignore it (see mutual-exclusion comment at the tail).
+        supersedes_candidate: int | None = None
         if prior and result.new_source_ids:
-            supersedes = int(prior[-1]["id"])
+            supersedes_candidate = int(prior[-1]["id"])
 
         thinking_threshold = 0.98 if result.new_source_ids else 0.85
         tid, created = dedup.upsert_thinking(
@@ -91,28 +95,50 @@ class Orchestrator:
             thinking_text,
             cited,
             author="actor",
-            supersedes_id=supersedes,
+            supersedes_id=supersedes_candidate,
             threshold=thinking_threshold,
         )
+
+        # The three tail branches are mutually exclusive and must match
+        # ResearchResult.to_dict() exactly so provenance on disk matches
+        # what we report back to the caller.
+        #
+        #   Branch A (created=True):
+        #     A brand-new Thinking row was inserted. store.insert_thinking
+        #     already wrote (new_tid)-[:SUPERSEDES]->(supersedes_candidate)
+        #     inside upsert_thinking, so we only need to echo
+        #     supersedes_id into the result. No REUSES edge -- the new row
+        #     IS the live conclusion, nothing "collapsed."
+        #
+        #   Branch B (created=False, tid == latest prior thinking):
+        #     Dedup collapsed onto the row that is already the latest live
+        #     thinking in this objective. This is a pure no-op run: the
+        #     live answer has not moved. Record `reused_thinking_id` for
+        #     the caller, write NO edges. A REUSES edge here would be a
+        #     self-loop (forbidden by store.reuse) or spurious provenance.
+        #
+        #   Branch C (created=False, tid != latest prior thinking):
+        #     Dedup collapsed onto an OLDER row. The latest live thinking
+        #     in this objective traced back to `tid` because new evidence
+        #     pointed that way. Write (latest_id)-[:REUSES]->(tid) with
+        #     the convention "latest -> reused_ancestor". Do NOT set
+        #     supersedes_id: no new live thinking was produced this run.
         if created:
+            # Branch A
             result.new_thinking_id = tid
-            result.supersedes_id = supersedes
+            result.supersedes_id = supersedes_candidate
             store.update_objective(self.backend, objective_id, status="researched")
         else:
             result.reused_thinking_id = int(tid)
-            # Persist the reuse edge -- the SQLite version could not
-            # represent this fact; the graph version must.
             if prior:
                 latest_id = int(prior[-1]["id"])
                 if int(tid) != latest_id:
+                    # Branch C: collapse onto older row.
                     store.reuse(self.backend, latest_id, int(tid))
                     print(
                         f"[orchestrator] reused thinking {tid} is older than latest "
                         f"prior thinking {latest_id} for objective {objective_id}",
                         file=sys.stderr,
                     )
-                else:
-                    # Self-reuse on the latest row keeps the fact
-                    # observable via store.list_reuses.
-                    store.reuse(self.backend, latest_id, int(tid))
+                # Branch B: tid == latest_id -> no edge, no supersedes.
         return result
