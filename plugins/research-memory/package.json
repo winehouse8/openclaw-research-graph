@@ -1,0 +1,16 @@
+{
+  "name": "@openclaw/research-memory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenClaw research-memory plugin (wraps the openclaw-research-graph Python graph backend as canonical long-term memory).",
+  "type": "module",
+  "main": "./index.js",
+  "scripts": {
+    "test": "node --test test.js"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  }
+}

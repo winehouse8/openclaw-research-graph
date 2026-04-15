@@ -5,20 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "openclaw-research-graph"
 version = "0.1.0"
-description = "Continual research system with Neo4j-backed knowledge graph for OpenClaw"
-requires-python = ">=3.9"
-dependencies = [
-  "neo4j>=5.28"
-]
-
-[project.optional-dependencies]
-dev = ["pytest>=7"]
-
-[tool.setuptools]
-package-dir = {"" = "src"}
+description = "Continual research memory and retrieval for OpenClaw (stdlib only)."
+requires-python = ">=3.10"
+dependencies = []
 
 [tool.setuptools.packages.find]
-where = ["src"]
+include = ["research_graph*"]
 
-[project.scripts]
-research-graph = "research_graph.cli:main"
+[tool.setuptools.package-data]
+research_graph = ["_fixtures/*.json"]

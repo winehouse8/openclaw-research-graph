@@ -1,0 +1,33 @@
+{
+  "id": "research-memory",
+  "name": "Research Memory",
+  "description": "Long-term research memory + orchestration for OpenClaw, backed by the openclaw-research-graph Python graph backend. Exposes research/query/walk tools and slash commands and owns the canonical graph store so Claude/Codex harnesses are positioned as low-level executors below it.",
+  "version": "0.1.0",
+  "contracts": {
+    "tools": [
+      "research_topic",
+      "memory_search",
+      "memory_ingest",
+      "graph_walk",
+      "memory_status"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "dbPath": {
+        "type": "string",
+        "description": "Filesystem path for the research-graph JSON backend. Falls back to RESEARCH_GRAPH_DB env var or ./research_graph.json."
+      },
+      "python": {
+        "type": "string",
+        "description": "Python interpreter to use for subprocess bridging. Defaults to python3."
+      },
+      "packageDir": {
+        "type": "string",
+        "description": "Optional override for the research_graph package parent dir. Falls back to RESEARCH_GRAPH_PACKAGE_DIR env var or the plugin's repo root."
+      }
+    }
+  }
+}
