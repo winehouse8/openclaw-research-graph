@@ -316,6 +316,115 @@ def cmd_query(args: argparse.Namespace) -> dict:
         backend.close()
 
 
+def cmd_update(args: argparse.Namespace) -> dict:
+    """Update mutable metadata on a Source / Thinking / Objective row.
+
+    Spec L47 (CRUQD U) for plugin parity. Routes to
+    `store.update_source` / `update_thinking` / `update_objective`,
+    each of which has its own immutable allowlist enforced at the
+    store layer (content/content_hash NEVER mutable here — content
+    edits go through `dedup.upsert_*` which atomically re-indexes).
+
+    Payload shape:
+      {
+        "kind":   "source" | "thinking" | "objective",
+        "id":     int,
+        "fields": {field_name: value, ...}
+      }
+
+    Returns:
+      {"kind": ..., "id": ..., "updated": [field_names], "row": <new row>}
+    """
+    payload = json.loads(args.payload)
+    kind = payload.get("kind")
+    if kind not in ("source", "thinking", "objective"):
+        raise ValueError(f"kind must be source|thinking|objective, got {kind!r}")
+    if "id" not in payload:
+        raise ValueError("payload missing required field 'id'")
+    target_id = int(payload["id"])
+    fields = payload.get("fields") or {}
+    if not isinstance(fields, dict) or not fields:
+        raise ValueError("payload missing/empty 'fields' dict")
+
+    backend = get_default_backend(args.db)
+    try:
+        if kind == "source":
+            rg_store.update_source(backend, target_id, **fields)
+            row = rg_store.get_source(backend, target_id)
+        elif kind == "thinking":
+            rg_store.update_thinking(backend, target_id, **fields)
+            row = rg_store.get_thinking(backend, target_id)
+        else:
+            rg_store.update_objective(backend, target_id, **fields)
+            row = rg_store.get_objective(backend, target_id)
+        if row is None:
+            raise KeyError(f"unknown {kind}: {target_id}")
+        # Strip the term-frequency bag from the returned row — internal,
+        # not part of the public dict shape.
+        row = {k: v for k, v in row.items() if k != "_terms"}
+        return {
+            "kind": kind,
+            "id": target_id,
+            "updated": sorted(fields.keys()),
+            "row": row,
+        }
+    finally:
+        backend.close()
+
+
+def cmd_delete(args: argparse.Namespace) -> dict:
+    """Delete a Topic / Objective / Source / Thinking row.
+
+    Spec L49 (CRUQD D) for plugin parity. Routes to the corresponding
+    `store.delete_*` helper. Topic and Objective deletes cascade
+    through their child Sources / Thinkings (matches the existing
+    `store.delete_topic` / `delete_objective` semantics). Source and
+    Thinking deletes are leaf-only.
+
+    Payload shape:
+      {"kind": "topic" | "objective" | "source" | "thinking", "id": int}
+
+    Returns:
+      {"kind": ..., "id": ..., "deleted": true} on success.
+    Raises KeyError if the id does not exist (surfaced to caller as
+    a structured `ok=false` JSON envelope by `main()`).
+    """
+    payload = json.loads(args.payload)
+    kind = payload.get("kind")
+    if kind not in ("topic", "objective", "source", "thinking"):
+        raise ValueError(
+            f"kind must be topic|objective|source|thinking, got {kind!r}"
+        )
+    if "id" not in payload:
+        raise ValueError("payload missing required field 'id'")
+    target_id = int(payload["id"])
+
+    backend = get_default_backend(args.db)
+    try:
+        # Existence check before delete so the caller gets a clean error
+        # instead of a silent no-op.
+        if kind == "topic":
+            existing = backend.get_node(target_id)
+            if existing is None:
+                raise KeyError(f"unknown topic: {target_id}")
+            rg_store.delete_topic(backend, target_id)
+        elif kind == "objective":
+            if rg_store.get_objective(backend, target_id) is None:
+                raise KeyError(f"unknown objective: {target_id}")
+            rg_store.delete_objective(backend, target_id)
+        elif kind == "source":
+            if rg_store.get_source(backend, target_id) is None:
+                raise KeyError(f"unknown source: {target_id}")
+            rg_store.delete_source(backend, target_id)
+        else:  # thinking
+            if rg_store.get_thinking(backend, target_id) is None:
+                raise KeyError(f"unknown thinking: {target_id}")
+            backend.delete_node(target_id, cascade=False)
+        return {"kind": kind, "id": target_id, "deleted": True}
+    finally:
+        backend.close()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="research-memory-plugin-helper")
     p.add_argument("--db", required=True)
@@ -330,6 +439,14 @@ def _build_parser() -> argparse.ArgumentParser:
     query = sub.add_parser("query")
     query.add_argument("--payload", required=True,
                        help="JSON string: {question, kind?, top_k?, min_score?, topic_name?, topic_id?, objective_id?}")
+
+    update = sub.add_parser("update")
+    update.add_argument("--payload", required=True,
+                        help="JSON string: {kind, id, fields:{...}}")
+
+    delete = sub.add_parser("delete")
+    delete.add_argument("--payload", required=True,
+                        help="JSON string: {kind, id}")
 
     rt = sub.add_parser("research-topic")
     rt.add_argument("--topic", required=True)
@@ -349,6 +466,10 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_ingest(args)
         elif args.cmd == "query":
             out = cmd_query(args)
+        elif args.cmd == "update":
+            out = cmd_update(args)
+        elif args.cmd == "delete":
+            out = cmd_delete(args)
         elif args.cmd == "research-topic":
             out = cmd_research_topic(args)
         else:

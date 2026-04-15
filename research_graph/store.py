@@ -698,10 +698,151 @@ def cross_topic_shared_sources(backend: GraphBackend) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+_RETRIEVAL_INDEX_ATTR = "_retrieval_index"
+
+
+def _get_retrieval_index_slot(backend: GraphBackend, kind: str) -> dict:
+    """Per-kind global retrieval index used by `retrieval._rank` to:
+      - Read IDF (`total_docs` + `df`) without recomputing per query.
+      - Read postings (`term → set[doc_id]`) so the score loop can be
+        restricted to docs that share at least one query token, instead
+        of iterating every doc in the candidate scope.
+
+    Slot shape:
+        {
+            "total_docs":  int,
+            "df":          dict[term -> int],
+            "postings":    dict[term -> set[doc_id]],
+            "doc_terms":   dict[doc_id -> set[term]],
+            "built":       bool,
+        }
+
+    Built lazily on first access (walks `list_nodes(LABEL)` once),
+    incrementally maintained by `upsert_embedding`. Spec L51, L79
+    (RAG + long-running stability) — the previous code recomputed
+    DF inside `_rank` on every query, which made retrieval cost grow
+    O(N) per query before scoring even started.
+    """
+    indexes = getattr(backend, _RETRIEVAL_INDEX_ATTR, None)
+    if indexes is None:
+        indexes = {}
+        setattr(backend, _RETRIEVAL_INDEX_ATTR, indexes)
+    slot = indexes.get(kind)
+    if slot is None:
+        slot = {
+            "total_docs": 0,
+            "df": {},
+            "postings": {},
+            "doc_terms": {},
+            "built": False,
+        }
+        indexes[kind] = slot
+    return slot
+
+
+def _ensure_retrieval_index_built(backend: GraphBackend, kind: str) -> dict:
+    slot = _get_retrieval_index_slot(backend, kind)
+    if slot["built"]:
+        return slot
+    label = {"source": LABEL_SOURCE, "thinking": LABEL_THINKING}[kind]
+    df: dict = {}
+    postings: dict = {}
+    doc_terms: dict = {}
+    total = 0
+    for row in backend.list_nodes(label):
+        did = int(row["id"])
+        terms = row.get("_terms") or {}
+        if not terms:
+            continue
+        token_set = set(terms.keys())
+        doc_terms[did] = token_set
+        total += 1
+        for tok in token_set:
+            df[tok] = df.get(tok, 0) + 1
+            postings.setdefault(tok, set()).add(did)
+    slot["total_docs"] = total
+    slot["df"] = df
+    slot["postings"] = postings
+    slot["doc_terms"] = doc_terms
+    slot["built"] = True
+    return slot
+
+
 def upsert_embedding(
     backend: GraphBackend, kind: str, object_id: int, terms: dict
 ) -> None:
-    backend.update_node(int(object_id), {"_terms": dict(terms)})
+    """Write a doc's term-frequency bag AND incrementally update the
+    retrieval index (DF, postings, doc_terms, total_docs).
+
+    Order matters: we MUST build the retrieval index slot BEFORE
+    mutating the row's `_terms`. Otherwise the lazy build (if it
+    happens here) would walk the just-updated row and add the new
+    tokens once, and then the diff loop below would add them AGAIN
+    (double-counting). With the build-before-update ordering, the
+    slot reflects pre-update state, and the diff correctly applies
+    the delta.
+
+    Diff math:
+      old_terms = current `_terms.keys()` on the node (may be empty
+                  if this is a brand-new doc that just got created
+                  by insert_source and is being indexed for the
+                  first time).
+      new_terms = the keys of the `terms` arg the caller passed.
+      additions = new_terms - old_terms  → df += 1, postings += doc_id
+      removals  = old_terms - new_terms  → df -= 1, postings -= doc_id
+      total_docs delta:
+        - was-empty → now-non-empty: +1
+        - was-non-empty → now-empty: -1
+        - everything else: 0
+    """
+    object_id = int(object_id)
+    new_terms = set(terms.keys())
+
+    # Build retrieval index slot BEFORE we mutate `_terms`. This way
+    # the lazy build (if triggered) reads the pre-update row state
+    # and the diff below applies the correct delta.
+    slot = _ensure_retrieval_index_built(backend, kind)
+
+    # Read old term set from the slot's doc_terms cache (or fall back
+    # to reading the node directly if the slot doesn't have an entry
+    # for this doc yet — e.g. the doc was created via a path that
+    # bypassed the index hook).
+    old_terms: set[str] = set(slot["doc_terms"].get(object_id, set()))
+    if not old_terms:
+        old_row = backend.get_node(object_id)
+        if old_row is not None:
+            prev = old_row.get("_terms") or {}
+            old_terms = set(prev.keys())
+
+    backend.update_node(object_id, {"_terms": dict(terms)})
+
+    if old_terms and not new_terms:
+        slot["total_docs"] -= 1
+    elif new_terms and not old_terms:
+        slot["total_docs"] += 1
+    # else: was non-empty → still non-empty (or was empty → still empty)
+    #       no total_docs change.
+
+    # Remove old tokens that are NOT in the new set.
+    for tok in old_terms - new_terms:
+        cnt = slot["df"].get(tok, 0) - 1
+        if cnt <= 0:
+            slot["df"].pop(tok, None)
+        else:
+            slot["df"][tok] = cnt
+        bucket = slot["postings"].get(tok)
+        if bucket is not None:
+            bucket.discard(object_id)
+            if not bucket:
+                slot["postings"].pop(tok, None)
+    # Add new tokens that are NOT in the old set.
+    for tok in new_terms - old_terms:
+        slot["df"][tok] = slot["df"].get(tok, 0) + 1
+        slot["postings"].setdefault(tok, set()).add(object_id)
+    if new_terms:
+        slot["doc_terms"][object_id] = new_terms
+    else:
+        slot["doc_terms"].pop(object_id, None)
 
 
 def get_embeddings(

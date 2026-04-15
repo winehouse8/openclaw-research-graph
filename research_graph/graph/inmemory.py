@@ -103,6 +103,14 @@ class InMemoryGraphBackend:
         self._nodes: dict[int, dict[str, Any]] = {}
         self._out: dict[int, list[dict[str, Any]]] = {}
         self._in: dict[int, list[dict[str, Any]]] = {}
+        # Sidecar set-of-(rel, dst) for O(1) `has_edge`. The previous
+        # `for e in self._out[src]: if e.rel == rel and e.dst == dst`
+        # scan was O(out-degree), and on cProfile of N=2000 inserts it
+        # was the second-largest cost (14% / 0.156 s tottime) because
+        # `create_edge` calls `has_edge` for dedupe on every insert.
+        # Maintaining the set in lockstep with `_out` makes `has_edge`
+        # an O(1) set membership check.
+        self._out_keys: dict[int, set[tuple[str, int]]] = {}
         self._next_id: int = 1
         self._path: Path | None = None
         self._dirty: bool = False
@@ -118,6 +126,7 @@ class InMemoryGraphBackend:
         self._nodes[node_id] = {"label": label, "properties": props}
         self._out[node_id] = []
         self._in[node_id] = []
+        self._out_keys[node_id] = set()
         self._dirty = True
         return node_id
 
@@ -191,14 +200,20 @@ class InMemoryGraphBackend:
     def _delete_single(self, node_id: int) -> None:
         # remove the node
         self._nodes.pop(node_id, None)
+        self._out_keys.pop(node_id, None)
         # remove outbound edges and their inbound twins
         for e in self._out.pop(node_id, []):
             dst = int(e["dst"])
             self._in[dst] = [x for x in self._in.get(dst, []) if int(x["src"]) != node_id or x["rel"] != e["rel"]]
-        # remove inbound edges and their outbound twins
+        # remove inbound edges and their outbound twins. We also need
+        # to evict the matching (rel, node_id) tuples from each src's
+        # `_out_keys` sidecar set so `has_edge` stays consistent.
         for e in self._in.pop(node_id, []):
             src = int(e["src"])
             self._out[src] = [x for x in self._out.get(src, []) if int(x["dst"]) != node_id or x["rel"] != e["rel"]]
+            src_keys = self._out_keys.get(src)
+            if src_keys is not None:
+                src_keys.discard((e["rel"], int(node_id)))
 
     # ------------------------------------------------------------------
     # Edge operations
@@ -216,8 +231,12 @@ class InMemoryGraphBackend:
             raise KeyError(f"unknown src node: {src_id}")
         if dst_id not in self._nodes:
             raise KeyError(f"unknown dst node: {dst_id}")
-        if self.has_edge(src_id, rel, dst_id):
+        # O(1) duplicate check via the sidecar set.
+        keys = self._out_keys.setdefault(src_id, set())
+        edge_key = (rel, dst_id)
+        if edge_key in keys:
             return
+        keys.add(edge_key)
         props = dict(properties or {})
         self._out.setdefault(src_id, []).append(
             {"rel": rel, "dst": dst_id, "properties": props}
@@ -228,10 +247,12 @@ class InMemoryGraphBackend:
         self._dirty = True
 
     def has_edge(self, src_id: int, rel: str, dst_id: int) -> bool:
-        for e in self._out.get(int(src_id), []):
-            if e["rel"] == rel and int(e["dst"]) == int(dst_id):
-                return True
-        return False
+        # O(1) thanks to the sidecar set populated by create_edge /
+        # load_from_path. Was previously O(out-degree).
+        keys = self._out_keys.get(int(src_id))
+        if keys is None:
+            return False
+        return (rel, int(dst_id)) in keys
 
     def out_neighbors(
         self,
@@ -420,6 +441,7 @@ class InMemoryGraphBackend:
         self._nodes = {}
         self._out = {}
         self._in = {}
+        self._out_keys = {}
         for n in payload.get("nodes", []):
             nid = int(n["id"])
             self._nodes[nid] = {
@@ -428,6 +450,7 @@ class InMemoryGraphBackend:
             }
             self._out[nid] = []
             self._in[nid] = []
+            self._out_keys[nid] = set()
         for e in payload.get("edges", []):
             src = int(e["src"])
             dst = int(e["dst"])
@@ -439,6 +462,7 @@ class InMemoryGraphBackend:
             self._in.setdefault(dst, []).append(
                 {"rel": rel, "src": src, "properties": props}
             )
+            self._out_keys.setdefault(src, set()).add((rel, dst))
         self._next_id = int(payload.get("next_id", max(self._nodes) + 1 if self._nodes else 1))
         self._path = path
         self._dirty = False

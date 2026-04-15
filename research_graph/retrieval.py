@@ -45,24 +45,61 @@ def _cosine_score(
 
 
 def _rank(
-    query: str, embeddings: list[dict], top_k: int, min_score: float
+    query: str, embeddings: list[dict], top_k: int, min_score: float,
+    *,
+    idf_corpus: dict | None = None,
+    candidate_filter: set[int] | None = None,
 ) -> list[tuple[int, float]]:
+    """Score candidate embeddings against `query` using TF-IDF cosine.
+
+    Optimisation hooks (added in iter-3, spec L51 + L79):
+      - `idf_corpus`: a precomputed `{"total_docs": N, "df": {term: int}}`
+        from the global retrieval index. Skips per-query DF rebuild.
+        Falls back to local DF computation if None.
+      - `candidate_filter`: a set of doc_ids that are allowed to score.
+        The caller uses the global postings table to compute the
+        "docs that share at least one query token" set, so the score
+        loop only touches that subset rather than every embedding in
+        scope. Falls back to "score every embedding" if None.
+
+    Both hooks default to the legacy O(N · T) behaviour so existing
+    callers that don't pass them keep working.
+    """
     qt = tokens(query)
     if not qt or not embeddings:
         return []
     query_tf = dict(Counter(qt))
-    n = len(embeddings)
-    df: Counter = Counter()
-    for e in embeddings:
-        for term in e["terms"].keys():
-            df[term] += 1
+    if idf_corpus is not None:
+        n = max(int(idf_corpus.get("total_docs") or len(embeddings)), 1)
+        corpus_df = idf_corpus.get("df") or {}
+    else:
+        n = len(embeddings)
+        corpus_df = {}
+        for e in embeddings:
+            for term in e["terms"].keys():
+                corpus_df[term] = corpus_df.get(term, 0) + 1
     idf: dict[str, float] = {}
-    all_terms = set(df.keys()) | set(query_tf.keys())
+    all_terms = set(corpus_df.keys()) | set(query_tf.keys())
     for term in all_terms:
-        idf[term] = math.log((1 + n) / (1 + df.get(term, 0))) + 1.0
-    scored = [
-        (e["object_id"], _cosine_score(query_tf, e["terms"], idf)) for e in embeddings
-    ]
+        idf[term] = math.log((1 + n) / (1 + corpus_df.get(term, 0))) + 1.0
+
+    if candidate_filter is not None:
+        # Inverted-index path: only score embeddings whose object_id
+        # appears in the precomputed candidate set (= docs sharing at
+        # least one query token). Iterating the full embeddings list
+        # but skipping non-candidates is O(N) bookkeeping with O(K)
+        # actual scoring work where K = |candidate_filter|. For
+        # selective queries K << N.
+        scored = [
+            (e["object_id"], _cosine_score(query_tf, e["terms"], idf))
+            for e in embeddings
+            if int(e["object_id"]) in candidate_filter
+        ]
+    else:
+        scored = [
+            (e["object_id"], _cosine_score(query_tf, e["terms"], idf))
+            for e in embeddings
+        ]
     scored = [(i, s) for i, s in scored if s > min_score]
     scored.sort(key=lambda x: (-x[1], x[0]))
     return scored[:top_k]
@@ -108,6 +145,31 @@ def _candidate_thinkings(
     return rows
 
 
+def _build_candidate_filter(
+    backend, kind: str, query: str, scope_ids: set[int]
+) -> set[int]:
+    """Return the intersection of (a) docs that contain at least one
+    query token, with (b) the scope-restricted candidate id set.
+
+    Uses the global retrieval index `postings` table from
+    `store._get_retrieval_index_slot(backend, kind)`. Falls back to
+    "no filter" (= score everything) if the index is empty / unbuilt.
+    """
+    qt = set(tokens(query))
+    if not qt:
+        return scope_ids
+    slot = store._ensure_retrieval_index_built(backend, kind)
+    postings = slot.get("postings") or {}
+    if not postings:
+        return scope_ids
+    matched: set[int] = set()
+    for tok in qt:
+        bucket = postings.get(tok)
+        if bucket:
+            matched.update(bucket)
+    return matched & scope_ids
+
+
 def search_sources(
     backend,
     query: str,
@@ -121,7 +183,20 @@ def search_sources(
     candidates = _candidate_sources(backend, objective_id, topic_id, since, until)
     ids = [int(r["id"]) for r in candidates]
     embs = store.get_embeddings(backend, "source", ids)
-    ranked = _rank(query, embs, top_k, min_score)
+    # Hot path optimisations (iter-3):
+    #   1. Use the global IDF cache from the retrieval index so we
+    #      don't recompute DF on every query.
+    #   2. Prune the candidate set via the postings table — only docs
+    #      that share at least one query token get scored.
+    idf_corpus = store._ensure_retrieval_index_built(backend, "source")
+    candidate_filter = _build_candidate_filter(
+        backend, "source", query, set(ids)
+    )
+    ranked = _rank(
+        query, embs, top_k, min_score,
+        idf_corpus=idf_corpus,
+        candidate_filter=candidate_filter,
+    )
     by_id = {int(r["id"]): r for r in candidates}
     out: list[dict] = []
     for sid, score in ranked:
@@ -146,7 +221,15 @@ def search_thinkings(
     candidates = _candidate_thinkings(backend, objective_id, topic_id)
     ids = [int(r["id"]) for r in candidates]
     embs = store.get_embeddings(backend, "thinking", ids)
-    ranked = _rank(query, embs, top_k, min_score)
+    idf_corpus = store._ensure_retrieval_index_built(backend, "thinking")
+    candidate_filter = _build_candidate_filter(
+        backend, "thinking", query, set(ids)
+    )
+    ranked = _rank(
+        query, embs, top_k, min_score,
+        idf_corpus=idf_corpus,
+        candidate_filter=candidate_filter,
+    )
     by_id = {int(r["id"]): r for r in candidates}
     out: list[dict] = []
     for tid, score in ranked:
