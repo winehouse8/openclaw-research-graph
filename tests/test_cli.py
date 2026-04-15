@@ -112,7 +112,7 @@ class CLITest(unittest.TestCase):
         self.assertEqual(second[0]["new_sources"], [])
 
     def test_api_and_cli_return_identical_dict(self) -> None:
-        from research_graph import api, storage
+        from research_graph import api
 
         self._run("init")
         self._run("topic", "add", "llm")

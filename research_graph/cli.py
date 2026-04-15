@@ -3,13 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 
-from . import api, retrieval, schedule, storage
+from . import api, retrieval, schedule, store
+from .graph import get_default_backend
 from .orchestrator import Orchestrator
 
 
-DEFAULT_DB = "research_graph.db"
+DEFAULT_DB = "research_graph.json"
 
 
 def _print(obj, as_json: bool) -> None:
@@ -21,6 +21,16 @@ def _print(obj, as_json: bool) -> None:
                 print(row)
         else:
             print(obj)
+
+
+def _strip_terms(rows: list[dict]) -> list[dict]:
+    out = []
+    for r in rows:
+        c = dict(r)
+        c.pop("_terms", None)
+        c.pop("label", None)
+        out.append(c)
+    return out
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -72,6 +82,17 @@ def build_parser() -> argparse.ArgumentParser:
     th_list.add_argument("--objective", type=int, required=True)
     th_list.add_argument("--json", dest="as_json", action="store_true")
 
+    walk = sub.add_parser("walk")
+    walk_sub = walk.add_subparsers(dest="action", required=True)
+    walk_4 = walk_sub.add_parser("4hop")
+    walk_4.add_argument("--thinking", type=int, required=True)
+    walk_4.add_argument("--json", dest="as_json", action="store_true")
+    walk_co = walk_sub.add_parser("cocited")
+    walk_co.add_argument("--thinking", type=int, required=True)
+    walk_co.add_argument("--json", dest="as_json", action="store_true")
+    walk_cross = walk_sub.add_parser("cross-topic-sources")
+    walk_cross.add_argument("--json", dest="as_json", action="store_true")
+
     sch = sub.add_parser("schedule")
     sch_sub = sch.add_subparsers(dest="action", required=True)
     sch_cron = sch_sub.add_parser("cron")
@@ -90,47 +111,50 @@ def main(argv: list[str] | None = None) -> int:
     db = args.db
 
     if args.cmd == "init":
-        conn = storage.connect(db)
-        conn.close()
+        backend = get_default_backend(db)
+        try:
+            pass
+        finally:
+            backend.close()
         print(f"initialized {db}")
         return 0
 
     if args.cmd == "topic":
-        conn = storage.connect(db)
+        backend = get_default_backend(db)
         try:
             if args.action == "add":
-                tid = storage.create_topic(conn, args.name)
+                tid = store.create_topic(backend, args.name)
                 print(tid)
             elif args.action == "list":
-                _print(storage.list_topics(conn), getattr(args, "as_json", False))
+                _print(_strip_terms(store.list_topics(backend)), getattr(args, "as_json", False))
         finally:
-            conn.close()
+            backend.close()
         return 0
 
     if args.cmd == "objective":
-        conn = storage.connect(db)
+        backend = get_default_backend(db)
         try:
             if args.action == "add":
-                topic = storage.get_topic_by_name(conn, args.topic)
+                topic = store.get_topic_by_name(backend, args.topic)
                 if topic is None:
                     print(f"unknown topic: {args.topic}", file=sys.stderr)
                     return 2
-                oid = storage.create_objective(conn, int(topic["id"]), args.question)
+                oid = store.create_objective(backend, int(topic["id"]), args.question)
                 print(oid)
             elif args.action == "list":
                 topic_id = None
                 if args.topic:
-                    t = storage.get_topic_by_name(conn, args.topic)
+                    t = store.get_topic_by_name(backend, args.topic)
                     if t is None:
                         print(f"unknown topic: {args.topic}", file=sys.stderr)
                         return 2
                     topic_id = int(t["id"])
                 _print(
-                    storage.query_objectives(conn, topic_id=topic_id),
+                    _strip_terms(store.query_objectives(backend, topic_id=topic_id)),
                     getattr(args, "as_json", False),
                 )
         finally:
-            conn.close()
+            backend.close()
         return 0
 
     if args.cmd == "research":
@@ -139,43 +163,68 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "query":
-        conn = storage.connect(db)
+        backend = get_default_backend(db)
         try:
             if args.kind == "sources":
                 rows = retrieval.search_sources(
-                    conn, args.question, objective_id=args.objective, top_k=args.top_k
+                    backend, args.question, objective_id=args.objective, top_k=args.top_k
                 )
             else:
                 rows = retrieval.search_thinkings(
-                    conn, args.question, objective_id=args.objective, top_k=args.top_k
+                    backend, args.question, objective_id=args.objective, top_k=args.top_k
                 )
-            _print(rows, args.as_json)
+            _print(_strip_terms(rows), args.as_json)
         finally:
-            conn.close()
+            backend.close()
         return 0
 
     if args.cmd == "source":
-        conn = storage.connect(db)
+        backend = get_default_backend(db)
         try:
             if args.action == "list":
-                _print(storage.list_sources(conn, args.objective), getattr(args, "as_json", False))
+                _print(_strip_terms(store.list_sources(backend, args.objective)),
+                       getattr(args, "as_json", False))
             elif args.action == "delete":
-                storage.delete_source(conn, args.source_id)
+                store.delete_source(backend, args.source_id)
                 print(f"deleted {args.source_id}")
         finally:
-            conn.close()
+            backend.close()
         return 0
 
     if args.cmd == "thinking":
-        conn = storage.connect(db)
+        backend = get_default_backend(db)
         try:
             if args.action == "list":
                 _print(
-                    storage.list_thinkings(conn, args.objective),
+                    _strip_terms(store.list_thinkings(backend, args.objective)),
                     getattr(args, "as_json", False),
                 )
         finally:
-            conn.close()
+            backend.close()
+        return 0
+
+    if args.cmd == "walk":
+        backend = get_default_backend(db)
+        try:
+            if args.action == "4hop":
+                result = store.four_hop_evidence_walk(backend, args.thinking)
+                result = {
+                    "start": {k: v for k, v in result["start"].items() if k != "_terms"},
+                    "shared_sources": _strip_terms(result["shared_sources"]),
+                    "related_thinkings": _strip_terms(result["related_thinkings"]),
+                    "new_sources": _strip_terms(result["new_sources"]),
+                }
+                _print(result, getattr(args, "as_json", False))
+            elif args.action == "cocited":
+                rows = store.cocited_thinkings(backend, args.thinking)
+                _print(_strip_terms(rows), getattr(args, "as_json", False))
+            elif args.action == "cross-topic-sources":
+                rows = store.cross_topic_shared_sources(backend)
+                for r in rows:
+                    r["sources"] = _strip_terms(r["sources"])
+                _print(rows, getattr(args, "as_json", False))
+        finally:
+            backend.close()
         return 0
 
     if args.cmd == "schedule":

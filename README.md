@@ -1,23 +1,76 @@
 # openclaw-research-graph
 
-Continual research memory and retrieval layer for OpenClaw. Stdlib-only Python: SQLite for storage, hand-rolled TF-IDF for RAG, content-hash plus token-Jaccard dedup, and an actor/critic reasoning loop. Default external search is an offline JSON fixture so the system runs and tests deterministically without network.
-
-## Goals (from spec.md)
-
-- Long-running research over a topic with knowledge accumulation.
-- CRUQD plus dedup plus RAG over the knowledge layer.
-- Cold-start mode (external search only) and memory-augmented mode (retrieval plus optional refresh).
-- OpenClaw-callable as a CLI subprocess and as a Python library.
-- Daily 9 AM auto-research extensible structure.
+Continual research memory and retrieval layer for OpenClaw. The storage layer is a graph: labelled nodes (Topic, Objective, Source, Thinking) connected by typed relationships (HAS_OBJECTIVE, HAS_SOURCE, HAS_THINKING, CITES, SUPERSEDES, REUSES). Two interchangeable backends speak the same protocol: a pure-stdlib `InMemoryGraphBackend` used by tests and the default CLI, and a `Neo4jBackend` wrapping the official driver. Flip between them with a single environment variable.
 
 ## Install
 
-No dependencies. Requires Python 3.9+ (uses `from __future__ import annotations`).
+No dependencies required for the default (in-memory) backend. Python 3.9+.
 
 ```
 git clone <repo>
 cd openclaw-research-graph
-python3 -m research_graph init --db research.db
+python3 -m research_graph init --db research.json
+```
+
+To use the Neo4j backend: install the `neo4j` driver (already present on the dev host) and set the three env vars described below.
+
+## Architecture
+
+```
+research_graph/
+  graph/
+    model.py          Node, Edge, NodeRef dataclasses + label/rel constants
+    backend.py        GraphBackend Protocol (create_node, create_edge, ...)
+    inmemory.py       InMemoryGraphBackend (adjacency-list + JSON persistence)
+    neo4j_backend.py  Neo4jBackend (bolt driver, Cypher translation)
+    factory.py        get_default_backend() - env-driven selection
+  store.py            Domain layer: create_topic, create_objective, insert_source,
+                      insert_thinking, supersede, reuse, four_hop_evidence_walk,
+                      cocited_thinkings, cross_topic_shared_sources, ...
+  dedup.py            Content-hash + token-Jaccard near-dup (graph-aware)
+  retrieval.py        TF-IDF over node properties (backend-agnostic)
+  reasoning.py        actor_propose + critic_verify (reads via store)
+  orchestrator.py     Cold-start vs memory-augmented loop; persists REUSES edges
+  api.py              Library entry point
+  cli.py              argparse subcommands, including walk 4hop / cocited / cross-topic
+  schedule.py         Cron line generator + idempotent runner
+```
+
+## Graph schema
+
+Node labels:
+
+- `Topic { id, name, created_at }`
+- `Objective { id, question, status, created_at, updated_at, topic_id }`
+- `Source { id, url, title, content, content_hash, fetched_at, search_query, objective_id }`
+- `Thinking { id, content, content_hash, author, created_at, supersedes_id, objective_id }`
+
+Relationships:
+
+- `(Topic)-[:HAS_OBJECTIVE]->(Objective)`
+- `(Objective)-[:HAS_SOURCE]->(Source)`
+- `(Objective)-[:HAS_THINKING]->(Thinking)`
+- `(Thinking)-[:CITES]->(Source)` — replaces the legacy `supports_source_ids` blob
+- `(Thinking)-[:SUPERSEDES]->(Thinking)` — replaces `supersedes_id` self-FK
+- `(Thinking)-[:REUSES]->(Thinking)` — new: dedup-collapse fact that used to be in-memory only
+
+Uniqueness constraints (enforced by Cypher on Neo4j, by the store layer on in-memory): `Topic.name` unique, `Source.content_hash` unique within an objective, `Thinking.content_hash` unique within an objective.
+
+## Backends
+
+Selection is driven by `OPENCLAW_GRAPH_BACKEND`:
+
+```
+# default: stdlib in-memory graph persisted to JSON at --db PATH
+python3 -m research_graph --db research.json init
+
+# real Neo4j backend
+export OPENCLAW_GRAPH_BACKEND=neo4j
+export NEO4J_URI=bolt://localhost:7687
+export NEO4J_USER=neo4j
+export NEO4J_PASSWORD=...
+export NEO4J_DATABASE=neo4j     # optional
+python3 -m research_graph init
 ```
 
 ## CLI
@@ -29,75 +82,32 @@ python3 -m research_graph topic list [--json]
 python3 -m research_graph objective add --topic <name> "<question>"
 python3 -m research_graph objective list [--topic <name>] [--json]
 python3 -m research_graph research <objective_id> [--force-refresh] [--json]
-python3 -m research_graph query "<question>" [--kind sources|thinkings] [--top-k N] [--objective <id>] [--json]
+python3 -m research_graph query "<q>" [--kind sources|thinkings] [--objective <id>] [--json]
 python3 -m research_graph source list --objective <id> [--json]
-python3 -m research_graph source delete <source_id>
 python3 -m research_graph thinking list --objective <id> [--json]
+python3 -m research_graph walk 4hop --thinking <id> [--json]
+python3 -m research_graph walk cocited --thinking <id> [--json]
+python3 -m research_graph walk cross-topic-sources [--json]
 python3 -m research_graph schedule cron --hour 9 --topic <name>
 python3 -m research_graph schedule once --topic <name> [--json]
 ```
 
-## OpenClaw integration
+## Multi-hop queries
 
-Three integration paths, in order of preference:
+`store.four_hop_evidence_walk(thinking_id)` is the canonical example from `docs/sqlite-vs-neo4j-analysis.md`. Against Neo4j it translates to:
 
-1. **Subprocess + JSON**
-
-```
-python3 -m research_graph research 17 --json
-```
-
-returns `{"objective": {...}, "mode": "memory_augmented", "new_sources": [...], "reused_sources": [...], "new_thinking": 42, "supersedes": 39, "rejected_reasons": []}`.
-
-2. **Library call**
-
-```python
-from research_graph import api
-result = api.research("research.db", objective_id=17)
+```cypher
+MATCH (t0:Thinking {id: $tid})-[:CITES]->(s0:Source)<-[:CITES]-(t1:Thinking)
+WHERE t1.id <> t0.id
+OPTIONAL MATCH (t1)-[:CITES]->(s1:Source)
+WHERE NOT (t0)-[:CITES]->(s1)
+RETURN t0,
+       collect(DISTINCT s0) AS shared_sources,
+       collect(DISTINCT t1) AS related_thinkings,
+       collect(DISTINCT s1) AS new_sources
 ```
 
-3. **Daily 9 AM cron**
-
-```
-python3 -m research_graph schedule cron --hour 9 --topic "local-llm-bench"
-# prints: 0 9 * * * /usr/bin/python3 -m research_graph schedule once --topic 'local-llm-bench' --db 'research.db'
-```
-
-`schedule once` is idempotent because dedup blocks identical sources from being inserted twice on the same day.
-
-## Architecture
-
-```
-research_graph/
-  storage.py       SQLite schema, CRUQD primitives, cascade delete
-  dedup.py         Content-hash + token-Jaccard near-dup, separate spaces for source and thinking
-  retrieval.py     TF-IDF index, filter then rank then relevance threshold
-  search.py        Pluggable external search; default is offline JSON fixture
-  reasoning.py     Actor synthesizes thinking from sources; critic enforces quote budget
-  orchestrator.py  Cold-start vs memory-augmented research loop with supersession chain
-  api.py           Library entry for OpenClaw
-  cli.py           argparse subcommands with --json mode
-  schedule.py      Cron line generator and idempotent runner
-```
-
-### Source vs thinking separation
-
-Per spec: "source and thinking must not be mixed". Two enforcement points:
-
-- `dedup` keeps independent dedup spaces -- a source and a thinking with identical content do not collide.
-- `reasoning.critic_verify` rejects thinkings that quote source text verbatim beyond a small budget (max 2 quotes, max 200 chars per quote, no full-body repetition).
-
-### Cold-start vs memory-augmented
-
-`Orchestrator.research(objective_id, force_refresh=False)`:
-
-- If the objective has zero sources: cold-start mode -- call external search, ingest hits.
-- Otherwise: memory-augmented mode -- skip external search unless `force_refresh=True`. Retrieve top sources from local storage and feed them to the actor.
-- When new evidence arrives during a refresh, the new thinking is created with `supersedes_id` pointing to the prior thinking. The prior is preserved as history.
-
-### External search plug-in
-
-Set `OPENCLAW_RESEARCH_SEARCH=mypkg.mymodule.factory` to swap in a real search backend. The factory must return an object with `search(query: str) -> list[SearchHit]`. The default `OfflineFixtureSearch` reads `research_graph/_fixtures/search.json` so tests and the cron job stay deterministic without network access.
+`store.cocited_thinkings` (Cypher equivalent in `store.py`), `store.supersession_chain`, and `store.cross_topic_shared_sources` follow the same pattern: pure Python adjacency walks for the in-memory backend, equivalent Cypher on Neo4j.
 
 ## Tests
 
@@ -105,4 +115,15 @@ Set `OPENCLAW_RESEARCH_SEARCH=mypkg.mymodule.factory` to swap in a real search b
 python3 -m unittest discover -s tests -v
 ```
 
-23 tests, all passing under stdlib `unittest`. No third-party packages required.
+50 tests. The Neo4j smoke test (`tests/test_neo4j_backend_smoke.py`) skips unless `OC_TEST_NEO4J_URI`, `OC_TEST_NEO4J_USER`, `OC_TEST_NEO4J_PASSWORD` are set, so the default suite runs without touching any live database.
+
+## Demos
+
+```
+python3 scripts/demo_research_graph.py     # in-memory; 3 topics, 5 days, supersession + 4-hop walk
+python3 scripts/demo_neo4j_backend.py      # real Neo4j; skips cleanly if NEO4J_* unset
+```
+
+## Design notes
+
+See `docs/sqlite-vs-neo4j-analysis.md` for the rationale behind the graph-first model and the motivating multi-hop queries.

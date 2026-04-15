@@ -3,7 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from . import storage
+from . import store
+from .graph import get_default_backend
 from .orchestrator import Orchestrator
 
 
@@ -16,14 +17,14 @@ def cron_line(hour: int, topic: str, db_path: str) -> str:
 
 
 def run_once_for_topic(db_path: str | Path, topic_name: str) -> list[dict]:
-    conn = storage.connect(db_path)
+    backend = get_default_backend(db_path)
     try:
-        topic = storage.get_topic_by_name(conn, topic_name)
+        topic = store.get_topic_by_name(backend, topic_name)
         if topic is None:
             return []
-        orch = Orchestrator(conn)
+        orch = Orchestrator(backend)
         out = []
-        for obj in storage.query_objectives(conn, topic_id=int(topic["id"])):
+        for obj in store.list_objectives(backend, topic_id=int(topic["id"])):
             res = orch.research(int(obj["id"]))
             out.append(
                 {
@@ -35,4 +36,4 @@ def run_once_for_topic(db_path: str | Path, topic_name: str) -> list[dict]:
             )
         return out
     finally:
-        conn.close()
+        backend.close()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass, field
 
-from . import dedup, reasoning, retrieval, storage
+from . import dedup, reasoning, retrieval, store
 from .search import ExternalSearch, get_default_search
 
 
@@ -19,7 +19,6 @@ class ResearchResult:
     rejected_reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        """Canonical JSON-serializable shape used by api.research and the CLI."""
         return {
             "objective_id": int(self.objective_id),
             "mode": self.mode,
@@ -31,15 +30,19 @@ class ResearchResult:
 
 
 class Orchestrator:
-    def __init__(self, conn, search: ExternalSearch | None = None) -> None:
-        self.conn = conn
+    def __init__(self, backend, search: ExternalSearch | None = None) -> None:
+        self.backend = backend
+        # keep .conn as a back-compat alias so any external caller that
+        # poked at orch.conn before the rename still works against the
+        # graph backend it now points at.
+        self.conn = backend
         self.search = search or get_default_search()
 
     def research(self, objective_id: int, force_refresh: bool = False) -> ResearchResult:
-        obj = storage.get_objective(self.conn, objective_id)
+        obj = store.get_objective(self.backend, objective_id)
         if obj is None:
             raise ValueError(f"unknown objective: {objective_id}")
-        existing_sources = storage.list_sources(self.conn, objective_id)
+        existing_sources = store.list_sources(self.backend, objective_id)
         mode = "cold_start" if not existing_sources else "memory_augmented"
         result = ResearchResult(objective_id=objective_id, mode=mode)
 
@@ -48,7 +51,7 @@ class Orchestrator:
             hits = self.search.search(obj["question"])
             for hit in hits:
                 sid, created = dedup.upsert_source(
-                    self.conn,
+                    self.backend,
                     objective_id,
                     hit.url,
                     hit.title,
@@ -60,38 +63,30 @@ class Orchestrator:
                 else:
                     result.reused_source_ids.append(sid)
 
-        # filter -> RAG -> relevance: pick top sources for actor
         ranked = retrieval.search_sources(
-            self.conn,
+            self.backend,
             obj["question"],
             objective_id=objective_id,
             top_k=5,
             min_score=0.0,
         )
         if not ranked:
-            ranked = storage.list_sources(self.conn, objective_id)
+            ranked = store.list_sources(self.backend, objective_id)
 
         thinking_text, cited = reasoning.actor_propose(ranked, obj["question"])
-        verdict = reasoning.critic_verify(self.conn, thinking_text, cited)
+        verdict = reasoning.critic_verify(self.backend, thinking_text, cited)
         if not verdict.accepted:
             result.rejected_reasons = verdict.reasons
             return result
 
-        prior = storage.list_thinkings(self.conn, objective_id)
+        prior = store.list_thinkings(self.backend, objective_id)
         supersedes = None
         if prior and result.new_source_ids:
-            # new evidence arrived -> chain from latest prior thinking
             supersedes = int(prior[-1]["id"])
 
-        # When new evidence has arrived this run, require a much tighter
-        # Jaccard match before collapsing the thinking onto an older row.
-        # Otherwise adding one source to a multi-source corpus would land
-        # just above the 0.85 similarity threshold and silently erase the
-        # new conclusion. When there is no new evidence we keep the looser
-        # 0.85 so repeated no-op runs still dedupe cleanly.
         thinking_threshold = 0.98 if result.new_source_ids else 0.85
         tid, created = dedup.upsert_thinking(
-            self.conn,
+            self.backend,
             objective_id,
             thinking_text,
             cited,
@@ -102,16 +97,22 @@ class Orchestrator:
         if created:
             result.new_thinking_id = tid
             result.supersedes_id = supersedes
-            storage.update_objective(self.conn, objective_id, status="researched")
+            store.update_objective(self.backend, objective_id, status="researched")
         else:
-            # dedup collapsed onto an existing thinking -- report which one we reused
             result.reused_thinking_id = int(tid)
+            # Persist the reuse edge -- the SQLite version could not
+            # represent this fact; the graph version must.
             if prior:
                 latest_id = int(prior[-1]["id"])
                 if int(tid) != latest_id:
+                    store.reuse(self.backend, latest_id, int(tid))
                     print(
                         f"[orchestrator] reused thinking {tid} is older than latest "
                         f"prior thinking {latest_id} for objective {objective_id}",
                         file=sys.stderr,
                     )
+                else:
+                    # Self-reuse on the latest row keeps the fact
+                    # observable via store.list_reuses.
+                    store.reuse(self.backend, latest_id, int(tid))
         return result

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
-from pathlib import Path
 
-from research_graph import storage
+from research_graph import store
+from research_graph.graph import InMemoryGraphBackend
 from research_graph.orchestrator import Orchestrator
 from research_graph.search import OfflineFixtureSearch, SearchHit
 
@@ -30,20 +29,15 @@ class StubSearch:
 
 class OrchestratorTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.conn = storage.connect(Path(self.tmp.name) / "o.db")
-        tid = storage.create_topic(self.conn, "llm")
-        self.oid = storage.create_objective(
-            self.conn, tid, "best local llm on 16gb mac mini"
+        self.backend = InMemoryGraphBackend()
+        tid = store.create_topic(self.backend, "llm")
+        self.oid = store.create_objective(
+            self.backend, tid, "best local llm on 16gb mac mini"
         )
-
-    def tearDown(self) -> None:
-        self.conn.close()
-        self.tmp.cleanup()
 
     def test_cold_start_then_memory_augmented(self) -> None:
         stub = StubSearch()
-        orch = Orchestrator(self.conn, search=stub)
+        orch = Orchestrator(self.backend, search=stub)
 
         r1 = orch.research(self.oid)
         self.assertEqual(r1.mode, "cold_start")
@@ -51,47 +45,42 @@ class OrchestratorTest(unittest.TestCase):
         self.assertIsNotNone(r1.new_thinking_id)
         self.assertIsNone(r1.supersedes_id)
 
-        # second run with no force_refresh: memory_augmented, no new sources, no new thinking
         r2 = orch.research(self.oid)
         self.assertEqual(r2.mode, "memory_augmented")
         self.assertEqual(r2.new_source_ids, [])
 
-        # force refresh introduces new evidence -> supersession chain
         r3 = orch.research(self.oid, force_refresh=True)
         self.assertEqual(r3.mode, "memory_augmented")
         self.assertEqual(len(r3.new_source_ids), 1)
         self.assertIsNotNone(r3.new_thinking_id)
         self.assertEqual(r3.supersedes_id, r1.new_thinking_id)
 
-        # supersession chain: thinking r3 points to r1
-        th = storage.get_thinking(self.conn, r3.new_thinking_id)
+        th = store.get_thinking(self.backend, r3.new_thinking_id)
         self.assertEqual(th["supersedes_id"], r1.new_thinking_id)
-        # prior thinking still exists (history preserved)
-        self.assertIsNotNone(storage.get_thinking(self.conn, r1.new_thinking_id))
+        self.assertIsNotNone(store.get_thinking(self.backend, r1.new_thinking_id))
 
     def test_offline_fixture_default(self) -> None:
-        orch = Orchestrator(self.conn, search=OfflineFixtureSearch())
+        orch = Orchestrator(self.backend, search=OfflineFixtureSearch())
         r = orch.research(self.oid)
         self.assertEqual(r.mode, "cold_start")
         self.assertGreater(len(r.new_source_ids), 0)
 
     def test_memory_augmented_dedup_reports_reuse(self) -> None:
         stub = StubSearch()
-        orch = Orchestrator(self.conn, search=stub)
+        orch = Orchestrator(self.backend, search=stub)
 
         cold = orch.research(self.oid)
         self.assertEqual(cold.mode, "cold_start")
-        self.assertIsNotNone(cold.new_thinking_id)
         cold_thinking_id = cold.new_thinking_id
 
-        # Re-run with force_refresh=False so no new sources arrive; the actor
-        # produces the same thinking which dedup collapses onto cold_thinking_id.
         again = orch.research(self.oid, force_refresh=False)
         self.assertEqual(again.mode, "memory_augmented")
         self.assertIsNone(again.new_thinking_id)
         self.assertEqual(again.reused_thinking_id, cold_thinking_id)
-        # Prior thinking row still exists.
-        self.assertIsNotNone(storage.get_thinking(self.conn, cold_thinking_id))
+        self.assertIsNotNone(store.get_thinking(self.backend, cold_thinking_id))
+        # Reuse edge was persisted.
+        reuses = store.list_reuses(self.backend, self.oid)
+        self.assertGreaterEqual(len(reuses), 1)
 
 
 class SearchBackendTest(unittest.TestCase):

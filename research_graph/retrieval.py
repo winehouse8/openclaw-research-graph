@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 
-from . import storage
+from . import store
 from .dedup import tokens
 
 
@@ -11,12 +11,12 @@ def _term_freq(text: str) -> dict[str, int]:
     return dict(Counter(tokens(text)))
 
 
-def index_source(conn, source_id: int, content: str) -> None:
-    storage.upsert_embedding(conn, "source", source_id, _term_freq(content))
+def index_source(backend, source_id: int, content: str) -> None:
+    store.upsert_embedding(backend, "source", source_id, _term_freq(content))
 
 
-def index_thinking(conn, thinking_id: int, content: str) -> None:
-    storage.upsert_embedding(conn, "thinking", thinking_id, _term_freq(content))
+def index_thinking(backend, thinking_id: int, content: str) -> None:
+    store.upsert_embedding(backend, "thinking", thinking_id, _term_freq(content))
 
 
 def _cosine_score(
@@ -24,17 +24,8 @@ def _cosine_score(
     doc_terms: dict[str, int],
     idf: dict[str, float],
 ) -> float:
-    """Length-normalized cosine similarity over TF-IDF vectors.
-
-    Dividing by the L2 norms of both the query and the document vector
-    penalizes long documents that merely happen to contain every query
-    token. A short document that matches a rare query term wins over a
-    longer document that matches only common terms, which is the
-    behaviour the e2e keyword-ranking tests exercise.
-    """
     if not doc_terms or not query_tf:
         return 0.0
-    # Query vector uses idf^2 weighting (standard tf-idf cosine form).
     dot = 0.0
     for qt, qf in query_tf.items():
         w_q = float(qf) * idf.get(qt, 0.0)
@@ -65,8 +56,6 @@ def _rank(
     for e in embeddings:
         for term in e["terms"].keys():
             df[term] += 1
-    # Smoothed idf; terms unseen in the corpus get idf 0 so they do not
-    # inflate the cosine norms with empty dimensions.
     idf: dict[str, float] = {}
     all_terms = set(df.keys()) | set(query_tf.keys())
     for term in all_terms:
@@ -79,8 +68,48 @@ def _rank(
     return scored[:top_k]
 
 
+def _candidate_sources(
+    backend,
+    objective_id: int | None,
+    topic_id: int | None,
+    since: str | None,
+    until: str | None,
+) -> list[dict]:
+    if objective_id is not None:
+        rows = store.list_sources(backend, objective_id)
+    elif topic_id is not None:
+        rows = []
+        for obj in store.list_objectives(backend, topic_id):
+            rows.extend(store.list_sources(backend, int(obj["id"])))
+    else:
+        rows = []
+        for obj in store.list_objectives(backend):
+            rows.extend(store.list_sources(backend, int(obj["id"])))
+    if since is not None:
+        rows = [r for r in rows if (r.get("fetched_at") or "") >= since]
+    if until is not None:
+        rows = [r for r in rows if (r.get("fetched_at") or "") <= until]
+    return rows
+
+
+def _candidate_thinkings(
+    backend, objective_id: int | None, topic_id: int | None
+) -> list[dict]:
+    if objective_id is not None:
+        return store.list_thinkings(backend, objective_id)
+    if topic_id is not None:
+        rows = []
+        for obj in store.list_objectives(backend, topic_id):
+            rows.extend(store.list_thinkings(backend, int(obj["id"])))
+        return rows
+    rows = []
+    for obj in store.list_objectives(backend):
+        rows.extend(store.list_thinkings(backend, int(obj["id"])))
+    return rows
+
+
 def search_sources(
-    conn,
+    backend,
     query: str,
     objective_id: int | None = None,
     topic_id: int | None = None,
@@ -89,55 +118,43 @@ def search_sources(
     top_k: int = 5,
     min_score: float = 0.0,
 ) -> list[dict]:
-    sql = "SELECT s.id FROM sources s JOIN objectives o ON o.id = s.objective_id WHERE 1=1"
-    args: list = []
-    if objective_id is not None:
-        sql += " AND s.objective_id = ?"
-        args.append(objective_id)
-    if topic_id is not None:
-        sql += " AND o.topic_id = ?"
-        args.append(topic_id)
-    if since is not None:
-        sql += " AND s.fetched_at >= ?"
-        args.append(since)
-    if until is not None:
-        sql += " AND s.fetched_at <= ?"
-        args.append(until)
-    ids = [int(r["id"]) for r in conn.execute(sql, args).fetchall()]
-    embs = storage.get_embeddings(conn, "source", ids)
+    candidates = _candidate_sources(backend, objective_id, topic_id, since, until)
+    ids = [int(r["id"]) for r in candidates]
+    embs = store.get_embeddings(backend, "source", ids)
     ranked = _rank(query, embs, top_k, min_score)
-    out = []
+    by_id = {int(r["id"]): r for r in candidates}
+    out: list[dict] = []
     for sid, score in ranked:
-        row = storage.get_source(conn, sid)
-        if row:
-            row["score"] = score
-            out.append(row)
+        row = by_id.get(int(sid))
+        if row is None:
+            continue
+        row = dict(row)
+        row.pop("_terms", None)
+        row["score"] = score
+        out.append(row)
     return out
 
 
 def search_thinkings(
-    conn,
+    backend,
     query: str,
     objective_id: int | None = None,
     topic_id: int | None = None,
     top_k: int = 5,
     min_score: float = 0.0,
 ) -> list[dict]:
-    sql = "SELECT t.id FROM thinkings t JOIN objectives o ON o.id = t.objective_id WHERE 1=1"
-    args: list = []
-    if objective_id is not None:
-        sql += " AND t.objective_id = ?"
-        args.append(objective_id)
-    if topic_id is not None:
-        sql += " AND o.topic_id = ?"
-        args.append(topic_id)
-    ids = [int(r["id"]) for r in conn.execute(sql, args).fetchall()]
-    embs = storage.get_embeddings(conn, "thinking", ids)
+    candidates = _candidate_thinkings(backend, objective_id, topic_id)
+    ids = [int(r["id"]) for r in candidates]
+    embs = store.get_embeddings(backend, "thinking", ids)
     ranked = _rank(query, embs, top_k, min_score)
-    out = []
+    by_id = {int(r["id"]): r for r in candidates}
+    out: list[dict] = []
     for tid, score in ranked:
-        row = storage.get_thinking(conn, tid)
-        if row:
-            row["score"] = score
-            out.append(row)
+        row = by_id.get(int(tid))
+        if row is None:
+            continue
+        row = dict(row)
+        row.pop("_terms", None)
+        row["score"] = score
+        out.append(row)
     return out

@@ -4,7 +4,7 @@ import difflib
 import re
 from dataclasses import dataclass
 
-from . import storage
+from . import store
 
 
 MAX_QUOTE_LEN = 200
@@ -29,13 +29,7 @@ _MAX_KEYWORDS_PER_SOURCE = 20
 
 
 def actor_propose(sources: list[dict], objective_question: str) -> tuple[str, list[int]]:
-    """Synthesize a thinking from sources by extracting distinct keywords -- never verbatim chunks.
-
-    The synthesis is deliberately verbose (id + url + title + many keywords)
-    so that adding or swapping a single source materially changes the
-    output token set and the downstream Jaccard dedup does not collapse
-    semantically-distinct conclusions onto an earlier thinking row.
-    """
+    """Synthesize a thinking from sources by extracting distinct keywords."""
     if not sources:
         return ("No sources available to reason from.", [])
     bullets = []
@@ -71,11 +65,6 @@ def actor_propose(sources: list[dict], objective_question: str) -> tuple[str, li
 
 
 def _verbatim_overlap(thinking: str, source_text: str) -> int:
-    """Length of longest verbatim run from source found in thinking.
-
-    Uses difflib.SequenceMatcher.find_longest_match so that adversarial
-    quotes starting at non-zero source offsets are still detected.
-    """
     if not thinking or not source_text:
         return 0
     matcher = difflib.SequenceMatcher(a=source_text, b=thinking, autojunk=False)
@@ -83,11 +72,11 @@ def _verbatim_overlap(thinking: str, source_text: str) -> int:
     return int(match.size)
 
 
-def critic_verify(conn, thinking_text: str, cited_source_ids: list[int]) -> CriticVerdict:
+def critic_verify(backend, thinking_text: str, cited_source_ids: list[int]) -> CriticVerdict:
     reasons: list[str] = []
     sources: list[dict] = []
     for sid in cited_source_ids:
-        s = storage.get_source(conn, sid)
+        s = store.get_source(backend, sid)
         if not s:
             reasons.append(f"cited source {sid} does not exist")
             continue
@@ -107,7 +96,6 @@ def critic_verify(conn, thinking_text: str, cited_source_ids: list[int]) -> Crit
             )
         if run >= MIN_VERBATIM_RUN:
             quote_run_count += 1
-        # also reject if the source body is repeated multiple times in the thinking
         body = s["content"].strip()
         if len(body) >= MIN_VERBATIM_RUN and thinking_text.count(body) >= 2:
             reasons.append(f"source {s['id']} repeated verbatim {thinking_text.count(body)} times")
