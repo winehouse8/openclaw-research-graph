@@ -1,14 +1,21 @@
-"""Canonical node / edge model shared by every graph backend.
+"""Canonical node / edge labels shared by every graph backend.
 
-The goal of this module is that a caller working against the interface in
-``backend.py`` never has to know whether it is talking to the pure-python
-in-memory graph or a real Neo4j instance -- the node and edge shapes are
-the same in both worlds.
+The graph backends return flat dicts (`{"id": ..., "label": ...,
+"properties": ...}`) rather than typed `Node` / `Edge` instances, so
+the dataclasses that previously lived here were dead code (zero
+constructor calls anywhere in `research_graph/`, `tests/`, or
+`plugins/`). Keeping them as exports gave new contributors a fake
+"typed model" to chase that doesn't actually exist in the codebase.
+
+Removed in iteration 2 (spec L73-74 anti-over-engineering):
+  - `Node` dataclass
+  - `Edge` dataclass
+  - `NodeRef` frozen dataclass
+
+The label / relationship constants below are the only API this
+module exposes now.
 """
 from __future__ import annotations
-
-from dataclasses import dataclass, field
-from typing import Any
 
 
 # ---------------------------------------------------------------------------
@@ -44,51 +51,5 @@ RELATIONSHIP_TYPES = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Data containers
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Node:
-    """A labelled vertex with a property bag.
-
-    ``id`` is assigned by the backend on creation. Property dicts are
-    shallow-copied defensively when crossing backend boundaries so callers
-    cannot accidentally mutate stored state.
-    """
-
-    id: int
-    label: str
-    properties: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return the flat dict representation used throughout the code.
-
-        Domain code expects to access node fields as ``row["id"]``,
-        ``row["name"]``, ``row["url"]``, etc. We flatten the property
-        bag into that shape and inject ``id`` / ``label`` so consumers
-        still have typing information available.
-        """
-        out: dict[str, Any] = dict(self.properties)
-        out["id"] = int(self.id)
-        out["label"] = self.label
-        return out
-
-
-@dataclass
-class Edge:
-    """A typed directed edge between two nodes."""
-
-    src_id: int
-    rel: str
-    dst_id: int
-    properties: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class NodeRef:
-    """A lightweight reference to a node without loading its properties."""
-
-    id: int
-    label: str
+# Note: Node / Edge / NodeRef dataclasses removed in iteration 2.
+# See module docstring above for rationale.

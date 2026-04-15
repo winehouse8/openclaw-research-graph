@@ -203,6 +203,119 @@ def cmd_research_topic(args: argparse.Namespace) -> dict:
     }
 
 
+def cmd_query(args: argparse.Namespace) -> dict:
+    """Read accumulated knowledge for a topic without running new research.
+
+    Spec L40 + L61-68: OpenClaw must be able to "관련 지식을 읽고 …
+    이후 reasoning 에서 다시 재사용." Before this command, the plugin
+    only exposed `status` (counts), `ingest` (write), and
+    `research-topic` (write+read entangled). There was no read-only
+    surface for "what do you already know about X?" — OpenClaw had to
+    invoke the CLI separately and parse JSON, which is awkward and
+    couples OpenClaw to the CLI shape.
+
+    Inputs (JSON payload via --payload, mirroring `cmd_ingest`):
+      {
+        "topic_name": "llm" | "topic_id": 7,        # one of the two
+        "question":   "best local llm",             # the query string
+        "kind":       "source" | "thinking" | "both",  # default "both"
+        "objective_id": 12,                          # optional scope
+        "top_k":     5,                              # default 5
+        "min_score": 0.0                             # default 0.0
+      }
+
+    Returns:
+      {
+        "topic_id": int | None,
+        "topic_name": str | None,
+        "objective_id": int | None,
+        "kind": "source" | "thinking" | "both",
+        "sources":   [ {id, url, title, content_snippet, score}, ... ],
+        "thinkings": [ {id, content_snippet, score, supports_source_ids}, ... ]
+      }
+
+    The command is read-only: it never writes to the graph, never
+    fetches external sources, and never invokes the orchestrator.
+    """
+    payload = json.loads(args.payload)
+    question = payload.get("question")
+    if not isinstance(question, str) or not question:
+        raise ValueError("payload missing required string field 'question'")
+    kind = payload.get("kind") or "both"
+    if kind not in ("source", "thinking", "both"):
+        raise ValueError(f"kind must be one of source|thinking|both, got {kind!r}")
+    top_k = int(payload.get("top_k") or 5)
+    min_score = float(payload.get("min_score") or 0.0)
+    objective_id = payload.get("objective_id")
+    if objective_id is not None:
+        objective_id = int(objective_id)
+
+    backend = get_default_backend(args.db)
+    try:
+        topic_id: int | None = None
+        topic_name: str | None = payload.get("topic_name")
+        if "topic_id" in payload and payload["topic_id"] is not None:
+            topic_id = int(payload["topic_id"])
+            row = rg_store.get_node(backend, topic_id) if hasattr(rg_store, "get_node") else None
+            # Fall back to direct backend lookup for the name when the
+            # store doesn't expose a Topic getter.
+            if row is None:
+                t = backend.get_node(topic_id)
+                if t is not None:
+                    topic_name = t.get("properties", {}).get("name") or topic_name
+        elif topic_name:
+            topic = rg_store.get_topic_by_name(backend, topic_name)
+            if topic is not None:
+                topic_id = int(topic["id"])
+
+        sources_out: list[dict] = []
+        thinkings_out: list[dict] = []
+        if kind in ("source", "both"):
+            rows = rg_retrieval.search_sources(
+                backend, question,
+                objective_id=objective_id,
+                topic_id=topic_id,
+                top_k=top_k,
+                min_score=min_score,
+            )
+            for r in rows:
+                content = r.get("content") or ""
+                sources_out.append({
+                    "id": int(r["id"]),
+                    "url": r.get("url"),
+                    "title": r.get("title"),
+                    "content_snippet": content[:280],
+                    "score": float(r.get("score") or 0.0),
+                })
+        if kind in ("thinking", "both"):
+            rows = rg_retrieval.search_thinkings(
+                backend, question,
+                objective_id=objective_id,
+                topic_id=topic_id,
+                top_k=top_k,
+                min_score=min_score,
+            )
+            for r in rows:
+                content = r.get("content") or ""
+                thinkings_out.append({
+                    "id": int(r["id"]),
+                    "content_snippet": content[:280],
+                    "score": float(r.get("score") or 0.0),
+                    "supports_source_ids": list(r.get("supports_source_ids") or []),
+                    "author": r.get("author"),
+                })
+        return {
+            "topic_id": topic_id,
+            "topic_name": topic_name,
+            "objective_id": objective_id,
+            "kind": kind,
+            "sources": sources_out,
+            "thinkings": thinkings_out,
+        }
+    finally:
+        backend.close()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="research-memory-plugin-helper")
     p.add_argument("--db", required=True)
@@ -213,6 +326,10 @@ def _build_parser() -> argparse.ArgumentParser:
     ingest = sub.add_parser("ingest")
     ingest.add_argument("--payload", required=True,
                         help="JSON string: {objective_id, sources:[{url,title,content}]}")
+
+    query = sub.add_parser("query")
+    query.add_argument("--payload", required=True,
+                       help="JSON string: {question, kind?, top_k?, min_score?, topic_name?, topic_id?, objective_id?}")
 
     rt = sub.add_parser("research-topic")
     rt.add_argument("--topic", required=True)
@@ -230,6 +347,8 @@ def main(argv: list[str] | None = None) -> int:
             out: Any = cmd_status(args)
         elif args.cmd == "ingest":
             out = cmd_ingest(args)
+        elif args.cmd == "query":
+            out = cmd_query(args)
         elif args.cmd == "research-topic":
             out = cmd_research_topic(args)
         else:

@@ -3,6 +3,21 @@
 Used as the default for tests, the CLI, and the offline demo. JSON
 persistence is provided so multiple CLI invocations sharing the same
 ``--db PATH`` argument preserve state across process boundaries.
+
+Concurrency model (spec L79 long-running stability):
+  - SINGLE WRITER, multiple READERS. The backend takes an exclusive
+    file lock around `save_to_path` and a shared file lock around
+    `load_from_path`. Two parallel writers will queue (the second
+    waits on the first), preventing the JSON-corruption race that
+    existed before this iteration. Reads can run concurrently with
+    other reads.
+  - Lock medium is `fcntl.flock` (Unix) on a sidecar `.lock` file
+    next to the JSON. Windows is best-effort (no-op fallback).
+  - The lock guards FILE I/O only, NOT in-memory state. Two backend
+    instances in the same process still share their `_nodes` dict
+    only via load/save — they are not thread-safe in-memory. The
+    spec's use case is single-process per cron run, so this is
+    sufficient.
 """
 from __future__ import annotations
 
@@ -10,6 +25,53 @@ import json
 from collections import deque
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl  # type: ignore[import-not-found]
+    _HAS_FLOCK = True
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
+    _HAS_FLOCK = False
+
+
+class _FileLock:
+    """Best-effort cross-process file lock (POSIX `fcntl.flock`).
+
+    On systems without `fcntl` (Windows) this is a no-op so the
+    backend stays usable in degraded mode. Use as a context manager:
+
+        with _FileLock(path, exclusive=True):
+            ...write JSON atomically...
+
+    Lock is released on context exit. Lock file is `<path>.lock`.
+    """
+
+    def __init__(self, target: Path, *, exclusive: bool) -> None:
+        self.target = Path(target)
+        self.exclusive = exclusive
+        self._fh = None  # type: ignore[var-annotated]
+
+    def __enter__(self) -> "_FileLock":
+        if not _HAS_FLOCK:
+            return self
+        lock_path = self.target.with_suffix(self.target.suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # Open for r+ if it exists, else w to create.
+        self._fh = open(lock_path, "a+", encoding="utf-8")  # noqa: SIM115
+        flag = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH  # type: ignore[union-attr]
+        fcntl.flock(self._fh.fileno(), flag)  # type: ignore[union-attr]
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._fh is None:
+            return
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)  # type: ignore[union-attr]
+        finally:
+            try:
+                self._fh.close()
+            finally:
+                self._fh = None
 
 from .model import (
     LABEL_OBJECTIVE,
@@ -334,9 +396,15 @@ class InMemoryGraphBackend:
             ],
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
-        tmp.replace(path)
+        # Exclusive file lock around the tmp+rename atomic write so
+        # parallel writers serialise instead of corrupting the JSON.
+        # Also held during the rename so a reader can't see the new
+        # path mid-replace. (The tmp file itself is only ours during
+        # the lock window.)
+        with _FileLock(path, exclusive=True):
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+            tmp.replace(path)
         self._dirty = False
 
     def load_from_path(self, path: Path) -> None:
@@ -344,8 +412,11 @@ class InMemoryGraphBackend:
         if not path.exists():
             self._path = path
             return
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
+        # Shared lock for reads — multiple loaders can run in parallel
+        # but a writer (exclusive) blocks them until its rename lands.
+        with _FileLock(path, exclusive=False):
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
         self._nodes = {}
         self._out = {}
         self._in = {}

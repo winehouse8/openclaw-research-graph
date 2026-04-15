@@ -1,8 +1,10 @@
-"""Graph backend subpackage: canonical node/edge model + pluggable backends."""
+"""Graph backend subpackage: label/relationship constants + pluggable backends.
+
+`Node` / `Edge` / `NodeRef` dataclasses were removed in iteration 2 —
+they had zero constructor calls in the entire codebase. See
+`research_graph.graph.model` docstring for rationale (spec L73-74).
+"""
 from .model import (
-    Edge,
-    Node,
-    NodeRef,
     LABEL_TOPIC,
     LABEL_OBJECTIVE,
     LABEL_SOURCE,
@@ -19,9 +21,6 @@ from .inmemory import InMemoryGraphBackend
 from .factory import get_default_backend
 
 __all__ = [
-    "Edge",
-    "Node",
-    "NodeRef",
     "LABEL_TOPIC",
     "LABEL_OBJECTIVE",
     "LABEL_SOURCE",
