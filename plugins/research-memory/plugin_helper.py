@@ -425,6 +425,54 @@ def cmd_delete(args: argparse.Namespace) -> dict:
         backend.close()
 
 
+def cmd_quality_trend(args: argparse.Namespace) -> dict:
+    """Return the quality-over-time trend for an objective.
+
+    Reads the JSONL run log at `<db_dir>/research_runs.jsonl` and
+    returns a trend summary: list of (timestamp, quality, outcome)
+    entries + monotonicity flag + improvement/regression counts.
+    """
+    from research_graph import evaluation as rg_eval
+
+    objective_id = getattr(args, "objective_id", None)
+    topic = getattr(args, "topic", None)
+    question = getattr(args, "question", None)
+    last_n = int(getattr(args, "last_n", None) or 20)
+
+    if objective_id is None:
+        if not topic or not question:
+            raise ValueError(
+                "quality-trend requires --objective-id OR both --topic and --question"
+            )
+        backend = get_default_backend(args.db)
+        try:
+            t = rg_store.get_topic_by_name(backend, topic)
+            if t is None:
+                return {"error": f"topic {topic!r} not found", "run_count": 0}
+            for row in rg_store.query_objectives(backend, topic_id=int(t["id"])):
+                if row.get("question") == question:
+                    objective_id = int(row["id"])
+                    break
+            if objective_id is None:
+                return {"error": f"objective not found for question {question!r}", "run_count": 0}
+        finally:
+            backend.close()
+
+    return rg_eval.quality_trend(
+        log_path=None, objective_id=int(objective_id),
+        last_n=last_n, db_path=args.db,
+    )
+
+
+def cmd_daily_summary(args: argparse.Namespace) -> dict:
+    """Run all objectives under a topic and return an aggregate daily summary."""
+    from research_graph import schedule as rg_schedule
+    return rg_schedule.run_daily_summary(
+        args.db, args.topic,
+        skip_external=bool(getattr(args, "skip_external", False)),
+    )
+
+
 def cmd_research_journey(args: argparse.Namespace) -> dict:
     """Continual-research entrypoint for the plugin (iter-5).
 
@@ -545,6 +593,18 @@ def _build_parser() -> argparse.ArgumentParser:
     history.add_argument("--topic", default=None)
     history.add_argument("--question", default=None)
 
+    # iter-7: quality-over-time trend from the evaluation run log.
+    qt = sub.add_parser("quality-trend")
+    qt.add_argument("--objective-id", type=int, default=None)
+    qt.add_argument("--topic", default=None)
+    qt.add_argument("--question", default=None)
+    qt.add_argument("--last-n", type=int, default=20)
+
+    # iter-7: daily summary (run all objectives under a topic).
+    ds = sub.add_parser("daily-summary")
+    ds.add_argument("--topic", required=True)
+    ds.add_argument("--skip-external", action="store_true")
+
     return p
 
 
@@ -568,6 +628,10 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_research_journey(args)
         elif args.cmd == "thinking-history":
             out = cmd_thinking_history(args)
+        elif args.cmd == "quality-trend":
+            out = cmd_quality_trend(args)
+        elif args.cmd == "daily-summary":
+            out = cmd_daily_summary(args)
         else:
             parser.print_help()
             return 1

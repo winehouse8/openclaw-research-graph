@@ -379,17 +379,18 @@ class ScheduleBringsNewEvidenceTest(unittest.TestCase):
         finally:
             orch_mod.get_default_search = original  # type: ignore[assignment]
 
-        # Day-1: cold start, brings in u1.
+        # iter-7: schedule now returns journey dicts — the run payload
+        # is nested under ["run"] and the mode/outcome under ["delta"].
         self.assertEqual(len(day1), 1)
-        self.assertEqual(day1[0]["mode"], "cold_start")
-        self.assertEqual(len(day1[0]["new_sources"]), 1)
+        self.assertEqual(day1[0]["run"]["mode"], "cold_start")
+        self.assertGreater(len(day1[0]["run"]["new_source_ids"]), 0)
         # Day-2: memory_augmented, MUST bring in u2 by default
         # (this was the spec-breaking bug). With FIX 1 + FIX 2, the
         # cron is functional.
         self.assertEqual(len(day2), 1)
-        self.assertEqual(day2[0]["mode"], "memory_augmented")
-        self.assertEqual(len(day2[0]["new_sources"]), 1,
-                          "scheduled run must bring in new external evidence by default")
+        self.assertEqual(day2[0]["run"]["mode"], "memory_augmented")
+        self.assertGreater(len(day2[0]["run"]["new_source_ids"]), 0,
+                           "scheduled run must bring in new external evidence by default")
 
 
 if __name__ == "__main__":

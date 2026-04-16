@@ -103,13 +103,14 @@ class CLITest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         first = json.loads(r.stdout.strip())
         self.assertEqual(len(first), 1)
-        first_new_sources = first[0]["new_sources"]
+        # iter-7: schedule returns journey dicts; run data nested under ["run"]
+        first_new_sources = first[0]["run"]["new_source_ids"]
 
         r = self._run("schedule", "once", "--topic", "llm", "--json")
         self.assertEqual(r.returncode, 0, r.stderr)
         second = json.loads(r.stdout.strip())
         # idempotent: second run produces no new sources due to dedup
-        self.assertEqual(second[0]["new_sources"], [])
+        self.assertEqual(second[0]["run"]["new_source_ids"], [])
 
     def test_api_and_cli_return_identical_dict(self) -> None:
         from research_graph import api
