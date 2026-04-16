@@ -22,11 +22,36 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import sys
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# Debug logging — writes to /tmp/research-memory-plugin.log so every
+# plugin call leaves a trace for troubleshooting. The log includes:
+#   - command + args received
+#   - topic/objective resolution
+#   - research_journey call + memory_before/after summaries
+#   - quality delta / outcome
+#   - errors with full stack context
+# View with:  tail -f /tmp/research-memory-plugin.log
+# ---------------------------------------------------------------------------
+
+_LOG_PATH = os.environ.get(
+    "RESEARCH_MEMORY_LOG",
+    "/tmp/research-memory-plugin.log",
+)
+_log = logging.getLogger("research-memory-plugin")
+_log.setLevel(logging.DEBUG)
+_handler = logging.FileHandler(_LOG_PATH, encoding="utf-8")
+_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%dT%H:%M:%S"
+))
+_log.addHandler(_handler)
 
 # Make the sibling `research_graph` package importable no matter where the
 # plugin is installed. Precedence:
@@ -490,13 +515,28 @@ def cmd_research_journey(args: argparse.Namespace) -> dict:
     Payload shape matches `api.research_journey` return value; see
     its docstring for keys.
     """
-    return rg_api.research_journey(
+    _log.info("research-journey: topic=%r question=%r db=%s skip_external=%s",
+              args.topic, args.question, args.db, args.skip_external)
+    result = rg_api.research_journey(
         args.db,
         topic=args.topic,
         question=args.question,
         skip_external=bool(args.skip_external),
         force_refresh=bool(args.force_refresh),
     )
+    delta = result.get("delta", {})
+    before = result.get("memory_before", {})
+    after = result.get("memory_after", {})
+    _log.info(
+        "research-journey DONE: outcome=%s quality_delta=%s "
+        "before={tip=%s q=%s src=%s} after={tip=%s q=%s src=%s}",
+        delta.get("outcome"), delta.get("quality_overall_delta"),
+        before.get("live_thinking_id"), before.get("live_quality_overall"),
+        before.get("source_count"),
+        after.get("live_thinking_id"), after.get("live_quality_overall"),
+        after.get("source_count"),
+    )
+    return result
 
 
 def cmd_thinking_history(args: argparse.Namespace) -> dict:
@@ -611,6 +651,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    _log.info(">>> plugin_helper invoked: cmd=%s db=%s argv=%s",
+              getattr(args, "cmd", "?"), getattr(args, "db", "?"),
+              argv or sys.argv[1:])
     try:
         if args.cmd == "status":
             out: Any = cmd_status(args)
@@ -636,17 +679,19 @@ def main(argv: list[str] | None = None) -> int:
             parser.print_help()
             return 1
     except Exception as exc:  # pragma: no cover - surfaced to caller
+        _log.error("!!! plugin_helper EXCEPTION: %s\n%s",
+                   exc, traceback.format_exc())
         print(json.dumps({
             "ok": False,
             "error": str(exc),
             "type": type(exc).__name__,
             "traceback": traceback.format_exc(),
         }))
-        # Always exit 0 so the JS caller does not collapse our structured
-        # error JSON into a flat stderr string. Failure is signalled by
-        # ok=false in the parsed object.
         return 0
 
+    _log.info("<<< plugin_helper OK: cmd=%s (output %d bytes)",
+              getattr(args, "cmd", "?"),
+              len(json.dumps(out, default=str)))
     print(json.dumps(out, default=str, sort_keys=True))
     return 0
 
