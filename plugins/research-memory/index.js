@@ -260,6 +260,64 @@ export const handlers = {
     });
   },
 
+  // iter-5 continual-research journey entrypoint. Delegates to the
+  // plugin_helper `research-journey` command, which wraps the
+  // Orchestrator with before/after memory snapshots and returns a
+  // rich narrative payload. This is the preferred way for a plugin
+  // caller (OpenClaw) to start or resume a research objective —
+  // `research_topic` is kept around for thin one-pass calls that
+  // only need the raw ResearchResult.
+  async researchJourney({
+    settings, topic, question,
+    skipExternal = false, forceRefresh = false,
+  }) {
+    if (!topic || !question) {
+      throw new Error("research_journey requires both `topic` and `question`");
+    }
+    if (typeof topic === "string" && topic.includes("::")) {
+      throw new Error(
+        `research_journey: topic must not contain '::' (got ${JSON.stringify(topic)}). ` +
+        "Topics are separated from questions by '::' in /research, so '::' is reserved.",
+      );
+    }
+    await preflightCheck(settings);
+    const args = helperArgs(settings, [
+      "research-journey",
+      "--topic", topic,
+      "--question", question,
+      ...(skipExternal ? ["--skip-external"] : []),
+      ...(forceRefresh ? ["--force-refresh"] : []),
+    ]);
+    return runPythonJson(settings.python, args, {
+      packageDir: settings.packageDir,
+    });
+  },
+
+  // iter-5 supersession-chain walk. Returns `{chain, siblings, ...}`
+  // so OpenClaw can surface "how did this answer evolve" views
+  // without having to walk edge labels itself. Accepts EITHER
+  // objectiveId OR (topic, question) for resolution; the helper
+  // is read-only and returns `{exists: false, ...}` when the
+  // (topic, question) pair has no objective yet.
+  async thinkingHistory({ settings, objectiveId, topic, question }) {
+    if (objectiveId == null && (!topic || !question)) {
+      throw new Error(
+        "thinking_history requires either `objective_id` or both `topic` and `question`",
+      );
+    }
+    await preflightCheck(settings);
+    const cliArgs = ["thinking-history"];
+    if (objectiveId != null) {
+      cliArgs.push("--objective-id", String(objectiveId));
+    }
+    if (topic) cliArgs.push("--topic", topic);
+    if (question) cliArgs.push("--question", question);
+    const args = helperArgs(settings, cliArgs);
+    return runPythonJson(settings.python, args, {
+      packageDir: settings.packageDir,
+    });
+  },
+
   async memorySearch({ settings, query, kind = "sources", topK = 5, objectiveId }) {
     if (!query) throw new Error("memory_search requires `query`");
     if (kind !== "sources" && kind !== "thinkings") {
@@ -325,8 +383,13 @@ export const handlers = {
 
 /**
  * Parse the raw argv for `/research <topic>::<question>` and dispatch to
- * researchTopic. The first `::` is the separator (use indexOf, not split):
- * topics MUST NOT contain `::`, but questions MAY contain `::` verbatim.
+ * the iter-5 research journey handler. The first `::` is the separator
+ * (use indexOf, not split): topics MUST NOT contain `::`, but questions
+ * MAY contain `::` verbatim. iter-5 changed the dispatch target from
+ * `researchTopic` (lean one-pass) to `researchJourney` (memory before /
+ * run / memory after / delta) so the default slash-command experience
+ * reflects continual-memory semantics instead of an opaque
+ * ResearchResult blob.
  */
 export async function parseAndRunResearchCommand(settings, argv) {
   const raw = (Array.isArray(argv) ? argv.join(" ") : String(argv || "")).trim();
@@ -352,7 +415,7 @@ export async function parseAndRunResearchCommand(settings, argv) {
       "Rename the topic or escape it; questions may contain '::' but topics may not.",
     );
   }
-  return handlers.researchTopic({ settings, topic, question });
+  return handlers.researchJourney({ settings, topic, question });
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +497,7 @@ async function buildEntry() {
       api.registerTool({
         name: "research_topic",
         description:
-          "Create (or reuse) a research objective for a (topic, question) pair and run one research cycle against the canonical research-graph memory. Returns the ResearchResult JSON.",
+          "Create (or reuse) a research objective for a (topic, question) pair and run one research cycle against the canonical research-graph memory. Returns the ResearchResult JSON. For long-term memory flows prefer `research_journey`, which adds before/after memory snapshots and a delta narrative.",
         parameters: paramSchema({
           topic: str(),
           question: str(),
@@ -446,6 +509,53 @@ async function buildEntry() {
             topic: p.topic,
             question: p.question,
             forceRefresh: !!p.force_refresh,
+          }),
+        ),
+      });
+
+      // iter-5: the continual-research headline tool. OpenClaw hits
+      // this for "start or resume research on topic X / question Y"
+      // and gets back:
+      //   - topic/objective existence flags (was this new or resumed?)
+      //   - memory_before / memory_after (live tip + siblings)
+      //   - run (raw ResearchResult from the orchestrator)
+      //   - delta (quality_overall_delta, outcome, narrative)
+      api.registerTool({
+        name: "research_journey",
+        description:
+          "Start or resume a long-term research objective. Resolves or creates the (topic, question) pair, snapshots live memory before and after a research cycle, and returns a rich delta payload { topic, objective, memory_before, run, memory_after, delta } suitable for direct narrative rendering. Use this instead of `research_topic` for any continual-memory flow — it reflects iter-4 quality-gated supersession and hypothesis branching so a weaker run is kept as a sibling branch without unseating the live answer.",
+        parameters: paramSchema({
+          topic: str(),
+          question: str(),
+          skip_external: opt({ type: "boolean" }),
+          force_refresh: opt({ type: "boolean" }),
+        }),
+        execute: wrapTool((settings, p) =>
+          handlers.researchJourney({
+            settings,
+            topic: p.topic,
+            question: p.question,
+            skipExternal: !!p.skip_external,
+            forceRefresh: !!p.force_refresh,
+          }),
+        ),
+      });
+
+      api.registerTool({
+        name: "thinking_history",
+        description:
+          "Walk the supersession chain from the current live tip of an objective down to its oldest ancestor, plus enumerate any sibling (branched / hypothesis) live thinkings. Pass either `objective_id` or `(topic, question)`. Read-only — never creates state. Returns { chain, siblings, warnings } where `chain[0]` is the live tip.",
+        parameters: paramSchema({
+          objective_id: opt(intT()),
+          topic: opt(str()),
+          question: opt(str()),
+        }),
+        execute: wrapTool((settings, p) =>
+          handlers.thinkingHistory({
+            settings,
+            objectiveId: p.objective_id,
+            topic: p.topic,
+            question: p.question,
           }),
         ),
       });
@@ -528,10 +638,31 @@ async function buildEntry() {
       api.registerCommand?.({
         name: "research",
         description:
-          "Start or resume a research objective. Usage: /research <topic>::<question>. The topic must NOT contain '::' (the first '::' is the separator); the question MAY contain '::' verbatim.",
+          "Start or resume a long-term research objective. Usage: /research <topic>::<question>. The topic must NOT contain '::' (the first '::' is the separator); the question MAY contain '::' verbatim. Returns a continual-memory journey payload (memory_before, run, memory_after, delta) — iter-5 default.",
         async execute({ argv }) {
           return runCommand(argv, async (settings, a) => {
             return parseAndRunResearchCommand(settings, a);
+          });
+        },
+      });
+
+      api.registerCommand?.({
+        name: "research-history",
+        description:
+          "Show the supersession chain + sibling hypothesis branches for a research objective. Usage: /research-history <topic>::<question>",
+        async execute({ argv }) {
+          return runCommand(argv, async (settings, a) => {
+            const raw = (Array.isArray(a) ? a.join(" ") : String(a || "")).trim();
+            const sepIdx = raw.indexOf("::");
+            if (sepIdx < 0) {
+              throw new Error("usage: /research-history <topic>::<question>");
+            }
+            const topic = raw.slice(0, sepIdx).trim();
+            const question = raw.slice(sepIdx + 2).trim();
+            if (!topic || !question) {
+              throw new Error("usage: /research-history <topic>::<question>");
+            }
+            return handlers.thinkingHistory({ settings, topic, question });
           });
         },
       });

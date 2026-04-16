@@ -425,6 +425,82 @@ def cmd_delete(args: argparse.Namespace) -> dict:
         backend.close()
 
 
+def cmd_research_journey(args: argparse.Namespace) -> dict:
+    """Continual-research entrypoint for the plugin (iter-5).
+
+    Delegates to `research_graph.api.research_journey`, which:
+      1. Resolves/creates (topic, objective) by exact-match name.
+      2. Snapshots live-memory state BEFORE the run (live tip id +
+         quality + snippet + sibling live thinkings).
+      3. Runs one orchestrator cycle.
+      4. Snapshots AFTER the run.
+      5. Classifies outcome (cold_start | improved | branched |
+         reused | rejected) and computes quality_delta.
+      6. Returns a rich payload the plugin surfaces directly to
+         OpenClaw without re-walking the graph.
+
+    Payload shape matches `api.research_journey` return value; see
+    its docstring for keys.
+    """
+    return rg_api.research_journey(
+        args.db,
+        topic=args.topic,
+        question=args.question,
+        skip_external=bool(args.skip_external),
+        force_refresh=bool(args.force_refresh),
+    )
+
+
+def cmd_thinking_history(args: argparse.Namespace) -> dict:
+    """Walk the supersession chain + sibling branches for an objective.
+
+    Takes `objective_id` OR `(topic, question)` — if topic+question is
+    supplied and the objective doesn't exist yet we return
+    `{exists: false, ...}` rather than creating anything, because this
+    command is read-only.
+    """
+    objective_id = getattr(args, "objective_id", None)
+    if objective_id is None:
+        topic_name = getattr(args, "topic", None)
+        question = getattr(args, "question", None)
+        if not topic_name or not question:
+            raise ValueError(
+                "thinking-history requires --objective-id OR "
+                "both --topic and --question"
+            )
+        backend = get_default_backend(args.db)
+        try:
+            topic = rg_store.get_topic_by_name(backend, topic_name)
+            if topic is None:
+                return {
+                    "objective_id": None,
+                    "exists": False,
+                    "live_tip_id": None,
+                    "chain": [],
+                    "siblings": [],
+                    "warnings": [f"topic {topic_name!r} does not exist"],
+                }
+            for row in rg_store.query_objectives(backend, topic_id=int(topic["id"])):
+                if row.get("question") == question:
+                    objective_id = int(row["id"])
+                    break
+            if objective_id is None:
+                return {
+                    "objective_id": None,
+                    "exists": False,
+                    "live_tip_id": None,
+                    "chain": [],
+                    "siblings": [],
+                    "warnings": [
+                        f"objective with question {question!r} not found under topic "
+                        f"{topic_name!r}"
+                    ],
+                }
+        finally:
+            backend.close()
+    return rg_api.thinking_history(args.db, int(objective_id))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="research-memory-plugin-helper")
     p.add_argument("--db", required=True)
@@ -453,6 +529,22 @@ def _build_parser() -> argparse.ArgumentParser:
     rt.add_argument("--question", required=True)
     rt.add_argument("--force-refresh", action="store_true")
 
+    # iter-5: continual-research journey entrypoint. Returns memory-
+    # before / run / memory-after / delta for plugin narration.
+    journey = sub.add_parser("research-journey")
+    journey.add_argument("--topic", required=True)
+    journey.add_argument("--question", required=True)
+    journey.add_argument("--skip-external", action="store_true",
+                         help="Skip external fetch (offline/replay path).")
+    journey.add_argument("--force-refresh", action="store_true",
+                         help="Deprecated alias kept for CLI compat.")
+
+    history = sub.add_parser("thinking-history")
+    history.add_argument("--objective-id", type=int, default=None,
+                         help="Objective id (preferred). If omitted you must pass --topic and --question.")
+    history.add_argument("--topic", default=None)
+    history.add_argument("--question", default=None)
+
     return p
 
 
@@ -472,6 +564,10 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_delete(args)
         elif args.cmd == "research-topic":
             out = cmd_research_topic(args)
+        elif args.cmd == "research-journey":
+            out = cmd_research_journey(args)
+        elif args.cmd == "thinking-history":
+            out = cmd_thinking_history(args)
         else:
             parser.print_help()
             return 1

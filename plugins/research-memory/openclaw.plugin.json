@@ -2,14 +2,23 @@
   "id": "research-memory",
   "name": "Research Memory",
   "description": "Long-term research memory + orchestration for OpenClaw, backed by the openclaw-research-graph Python graph backend. Exposes research/query/walk tools and slash commands and owns the canonical graph store so Claude/Codex harnesses are positioned as low-level executors below it.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "contracts": {
     "tools": [
       "research_topic",
+      "research_journey",
+      "thinking_history",
       "memory_search",
       "memory_ingest",
       "graph_walk",
       "memory_status"
+    ],
+    "commands": [
+      "research",
+      "research-history",
+      "memory-search",
+      "memory-status",
+      "graph-walk"
     ]
   },
   "configSchema": {
